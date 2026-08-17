@@ -3,7 +3,9 @@ import html as html_lib
 import json
 import logging
 import os
+import re
 import sqlite3
+from difflib import SequenceMatcher
 from datetime import datetime, timedelta
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
@@ -109,6 +111,48 @@ def is_end_marker(text: str) -> bool:
     return t in END_MARKERS or t.endswith(("끝", "종료", " end"))
 
 
+_MARKER_SUFFIX_RE = re.compile(r"^(.*?)(?:끝|종료|end)\s*$", re.IGNORECASE)
+
+
+def _normalize_text(t: str) -> str:
+    return re.sub(r"\s+", "", t).lower()
+
+
+def match_marker_to_activity(text: str, marker_ts: datetime) -> Optional[int]:
+    """'X 끝' 마커의 X가 직전 열려있는 활동과 (띄어쓰기 무시) 동일/유사하면
+    그 활동의 end_ts를 마커 시각으로 확정하고 이벤트 id를 반환.
+
+    매칭 조건: 정규화 후 동일, 포함 관계, 또는 유사도 ≥ 0.75.
+    대상은 '가장 최근의 비마커 이벤트' 1건 (end_ts 미설정, 24h 이내)만 — 병렬 활동 매칭은 추후.
+    """
+    m = _MARKER_SUFFIX_RE.match(text.strip())
+    base = m.group(1).strip() if m else ""
+    if not base:
+        return None  # 단독 "끝" — 매칭 대상 없음
+    with get_db() as conn:
+        prev = conn.execute(
+            "SELECT * FROM events WHERE COALESCE(effective_ts, ts) < ? "
+            "ORDER BY COALESCE(effective_ts, ts) DESC, id DESC LIMIT 1",
+            (marker_ts.isoformat(timespec="seconds"),),
+        ).fetchone()
+        if prev is None or is_end_marker(prev["raw_text"]) or prev["end_ts"] or prev["hidden"]:
+            return None
+        prev_start = parse_ts(prev["effective_ts"] or prev["ts"])
+        if prev_start is None or not (prev_start < marker_ts <= prev_start + timedelta(hours=24)):
+            return None
+        a = _normalize_text(base)
+        b = _normalize_text(prev["display_text"] or prev["raw_text"])
+        if not (a == b or a in b or b in a or SequenceMatcher(None, a, b).ratio() >= 0.75):
+            return None
+        conn.execute(
+            "UPDATE events SET end_ts = ? WHERE id = ?",
+            (marker_ts.isoformat(timespec="seconds"), prev["id"]),
+        )
+        logger.info("marker match: '%s' → id=%s end_ts=%s", base, prev["id"],
+                    marker_ts.isoformat(timespec="seconds"))
+        return prev["id"]
+
+
 class LogIn(BaseModel):
     text: str = ""
     ts: Optional[str] = None
@@ -129,15 +173,18 @@ def post_log(body: LogIn, x_token: str = Header(default="")):
         return JSONResponse({"ok": False, "error": "text is empty"}, status_code=400)
     # ts는 ISO8601만 신뢰. 파싱 불가한 형식(예: "2026. 8. 17. 오전 11:11")이면 서버 시각 사용
     parsed = parse_ts(body.ts) if body.ts else None
-    ts = (parsed or now_kst()).isoformat(timespec="seconds")
+    ts_dt = parsed or now_kst()
+    ts = ts_dt.isoformat(timespec="seconds")
     received_at = now_kst().isoformat(timespec="seconds")
+    # "X 끝" 마커면 직전 활동 X의 종료 시각으로 확정 기록 시도
+    matched_id = match_marker_to_activity(text, ts_dt) if is_end_marker(text) else None
     with get_db() as conn:
         cur = conn.execute(
             "INSERT INTO events (ts, received_at, raw_text, source) VALUES (?, ?, ?, ?)",
             (ts, received_at, text, body.source or "voice"),
         )
     logger.info("log id=%s source=%s text=%s", cur.lastrowid, body.source, text)
-    return {"ok": True, "id": cur.lastrowid, "ts": ts}
+    return {"ok": True, "id": cur.lastrowid, "ts": ts, "matched_end": matched_id}
 
 
 def _ui_forbidden(x_requested_with: str) -> Optional[JSONResponse]:
