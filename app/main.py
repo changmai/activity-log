@@ -211,8 +211,12 @@ def health():
 
 
 @app.post("/log")
-def post_log(body: LogIn, x_token: str = Header(default="")):
-    if not ACTIVITY_TOKEN or x_token != ACTIVITY_TOKEN:
+def post_log(body: LogIn, x_token: str = Header(default=""),
+             x_requested_with: str = Header(default="")):
+    # 인증: 단축어/터미널은 X-Token, 타임라인 빠른 입력칸은 X-Requested-With
+    # (커스텀 헤더는 cross-origin에서 preflight 없이 보낼 수 없음 — 편집 API들과 동일 수준)
+    token_ok = bool(ACTIVITY_TOKEN) and x_token == ACTIVITY_TOKEN
+    if not (token_ok or x_requested_with == "timeline"):
         return JSONResponse({"ok": False, "error": "unauthorized"}, status_code=401)
     text = body.text.strip()
     if not text:
@@ -877,6 +881,16 @@ def render_timeline(start_date: str, days: int, show_hidden: bool) -> str:
                   background: var(--fill); color: var(--accent); font-size: 17px;
                   font-weight: 600; cursor: pointer; }}
   .zoom button:active {{ opacity: .5; }}
+  .quickrow {{ display: flex; gap: 6px; padding: 7px 0 0; }}
+  #quickin {{ flex: 1; min-width: 0; height: 36px; font-size: 15px; border: none;
+              border-radius: 10px; background: var(--fill); color: var(--text);
+              padding: 0 12px; }}
+  #quickin:focus {{ outline: 2px solid rgba(0,122,255,.5); }}
+  #quickbtn {{ height: 36px; padding: 0 15px; border: none; border-radius: 10px;
+               background: var(--accent); color: #fff; font-size: 14px; font-weight: 600;
+               cursor: pointer; }}
+  #quickbtn:active {{ opacity: .5; }}
+  #quickbtn:disabled {{ opacity: .4; }}
   .totals {{ padding: 8px 0; display: flex; flex-wrap: wrap; gap: 5px; }}
   .chip {{ border-radius: 999px; padding: 3.5px 11px; font-size: 12px; font-weight: 600;
            white-space: nowrap; border: none; letter-spacing: -0.01em; }}
@@ -1005,6 +1019,10 @@ def render_timeline(start_date: str, days: int, show_hidden: bool) -> str:
       <button id="zoomout" aria-label="축소">−</button>
       <button id="zoomin" aria-label="확대">＋</button>
     </div>
+  </div>
+  <div class="quickrow">
+    <input type="text" id="quickin" placeholder="무엇을 하고 있나요? · 종료는 '~끝'" autocomplete="off">
+    <button id="quickbtn">기록</button>
   </div>
   <div class="totals">{empty_chip}{totals_html}</div>
   <div class="dayheads">{dayheads_html}</div>
@@ -1457,6 +1475,31 @@ def render_timeline(start_date: str, days: int, show_hidden: bool) -> str:
       location.href = '/timeline?date=' + ds + '&days=' + DAYS + HQ + '#now';
     }}
   }});
+
+  // 빠른 입력칸: 어느 기기든 브라우저에서 바로 기록 (마커 '~끝'도 동일 동작)
+  (function quickLog() {{
+    var qi = document.getElementById('quickin');
+    var qb = document.getElementById('quickbtn');
+    function send() {{
+      var t = qi.value.trim();
+      if (!t) return;
+      qb.disabled = true;
+      fetch('/log', {{
+        method: 'POST',
+        headers: {{ 'Content-Type': 'application/json', 'X-Requested-With': 'timeline' }},
+        body: JSON.stringify({{ text: t, source: 'web' }})
+      }}).then(function (r) {{
+        if (!r.ok) throw new Error('기록 실패 ' + r.status);
+        var ds = todayStr();
+        if (document.querySelector('.canvas[data-date="' + ds + '"]')) location.reload();
+        else location.href = '/timeline?date=' + ds + '&days=' + DAYS + HQ;
+      }}).catch(function (e) {{ alert(e.message); qb.disabled = false; }});
+    }}
+    qi.addEventListener('keydown', function (e) {{
+      if (e.key === 'Enter') {{ e.preventDefault(); send(); }}
+    }});
+    qb.addEventListener('click', send);
+  }})();
 
   // 현재 시각 표시선 (오늘 컬럼에만)
   function nowline() {{
