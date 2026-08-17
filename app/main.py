@@ -750,6 +750,10 @@ def render_day_column(date: str, blocks: list[dict], show_hidden: bool) -> str:
     return f'<div class="day"><div class="canvas" data-date="{date}">{"".join(parts)}</div></div>'
 
 
+def _fmt_min(m: int) -> str:
+    return f"{m // 60}시간 {m % 60}분" if m >= 60 else f"{m}분"
+
+
 def _chip(name: str, minutes: Optional[int]) -> str:
     color = UNCATEGORIZED_COLOR if name in (UNCATEGORIZED, "기록 없음") else category_color(name)
     if minutes is None:
@@ -783,6 +787,22 @@ def render_timeline(start_date: str, days: int, show_hidden: bool) -> str:
     totals_html = "".join(
         _chip(k, v) for k, v in sorted(totals.items(), key=lambda kv: -kv[1])
     ) or _chip("기록 없음", None)
+
+    # 오늘이 보이면 00:00~현재의 빈 시간을 실시간 칩으로 표시 (JS가 1분마다 갱신)
+    empty_chip = ""
+    if today in per_day:
+        now = now_kst()
+        elapsed = int((now - now.replace(hour=0, minute=0, second=0, microsecond=0))
+                      .total_seconds() // 60)
+        covered = min(union_minutes(per_day[today], clip_end=now), elapsed)
+        empty_min = max(0, elapsed - covered)
+        ongoing = any(b["ongoing"] for b in per_day[today])
+        cov_pct = round(covered * 100 / elapsed) if elapsed else 100
+        empty_chip = (
+            f'<span class="chip emptychip" id="emptychip" data-covered="{covered}" '
+            f'data-ongoing="{1 if ongoing else 0}">'
+            f"빈 시간 {_fmt_min(empty_min)} · 커버리지 {cov_pct}%</span>"
+        )
 
     dayheads_html = "".join(
         f'<a class="dayhead{" today" if d == today else ""}" href="/timeline?date={d}&days=1{hq}">'
@@ -860,6 +880,8 @@ def render_timeline(start_date: str, days: int, show_hidden: bool) -> str:
   .totals {{ padding: 8px 0; display: flex; flex-wrap: wrap; gap: 5px; }}
   .chip {{ border-radius: 999px; padding: 3.5px 11px; font-size: 12px; font-weight: 600;
            white-space: nowrap; border: none; letter-spacing: -0.01em; }}
+  .chip.emptychip {{ background: rgba(120,120,128,.16); color: #55555e;
+                     font-variant-numeric: tabular-nums; }}
   .dayheads {{ display: flex; margin-left: 44px; }}
   .dayhead {{ flex: 1; min-width: 0; display: flex; flex-direction: column; align-items: center;
               gap: 1px; padding: 4px 0 6px; text-decoration: none; }}
@@ -984,7 +1006,7 @@ def render_timeline(start_date: str, days: int, show_hidden: bool) -> str:
       <button id="zoomin" aria-label="확대">＋</button>
     </div>
   </div>
-  <div class="totals">{totals_html}</div>
+  <div class="totals">{empty_chip}{totals_html}</div>
   <div class="dayheads">{dayheads_html}</div>
 </div>
 <div class="layout">
@@ -1451,6 +1473,29 @@ def render_timeline(start_date: str, days: int, show_hidden: bool) -> str:
   }}
   nowline();
   setInterval(nowline, 60000);
+
+  // 실시간 빈 시간 칩: 진행 중 활동이 있으면 빈 시간 고정, 없으면 1분씩 증가
+  (function liveEmpty() {{
+    var ec = document.getElementById('emptychip');
+    if (!ec) return;
+    var covered0 = parseInt(ec.dataset.covered, 10);
+    var ongoing = ec.dataset.ongoing === '1';
+    var n0 = new Date();
+    var loadMin = n0.getHours() * 60 + n0.getMinutes();
+    function fmtMin(m) {{
+      return m >= 60 ? Math.floor(m / 60) + '시간 ' + (m % 60) + '분' : m + '분';
+    }}
+    function upd() {{
+      var n = new Date();
+      var elapsed = n.getHours() * 60 + n.getMinutes();
+      if (elapsed < loadMin) return;  // 자정 넘김 — 새로고침 전까지 갱신 중단
+      var covered = ongoing ? Math.min(covered0 + (elapsed - loadMin), elapsed) : covered0;
+      var empty = Math.max(0, elapsed - covered);
+      var pct = elapsed ? Math.round(covered * 100 / elapsed) : 100;
+      ec.textContent = '빈 시간 ' + fmtMin(empty) + ' · 커버리지 ' + pct + '%';
+    }}
+    setInterval(upd, 60000);
+  }})();
 
   // 최초 로드 시 보기 좋은 위치로 스크롤 (오늘: 현재-2h, 그 외: 06시)
   (function initialScroll() {{
