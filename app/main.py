@@ -1043,6 +1043,14 @@ def render_timeline(start_date: str, days: int, show_hidden: bool) -> str:
   var cur = {{ h: 0, m: 0 }};
 
   function pad2(n) {{ return String(n).padStart(2, '0'); }}
+  function addMin(hhmm, delta) {{
+    var t = Math.min(parseInt(hhmm.slice(0, 2), 10) * 60 + parseInt(hhmm.slice(3, 5), 10) + delta,
+                     23 * 60 + 59);
+    return pad2(Math.floor(t / 60)) + ':' + pad2(t % 60);
+  }}
+  function startOfSelected() {{
+    return (selected && selected.dataset.start) || '';
+  }}
   function setEndVal(v) {{
     endVal = v;
     enddisp.textContent = v || '–';
@@ -1060,8 +1068,20 @@ def render_timeline(start_date: str, days: int, show_hidden: bool) -> str:
       t = setTimeout(function () {{
         var idx = Math.max(0, Math.min(Math.round(el.scrollTop / WI), el.children.length - 1));
         if (cur[part] === idx && endVal) return;  // 위치 이동만으로는 변경 아님
+        var cand = {{ h: cur.h, m: cur.m }};
+        cand[part] = idx;
+        var candVal = pad2(cand.h) + ':' + pad2(cand.m);
+        var st = startOfSelected();
+        if (st && candVal <= st) {{
+          // 시작 이전 시각은 허용하지 않음 — 알림 후 유효한 값으로 되돌림
+          alert('종료 시각은 시작(' + st + ') 이후여야 해요');
+          var back = (endVal && endVal > st) ? endVal : addMin(st, 1);
+          setEndVal(back);
+          positionWheels(back);
+          return;
+        }}
         cur[part] = idx;
-        setEndVal(pad2(cur.h) + ':' + pad2(cur.m));
+        setEndVal(candVal);
         dirty.end = true;
       }}, 130);
     }});
@@ -1077,8 +1097,14 @@ def render_timeline(start_date: str, days: int, show_hidden: bool) -> str:
   document.getElementById('endcell').addEventListener('click', function () {{
     if (!wheelbox.hidden) {{ wheelbox.hidden = true; return; }}
     wheelbox.hidden = false;
-    // 미지정이면 현재 시각에서 시작 (휠이 정렬되며 값이 선택됨 — iOS와 동일)
-    positionWheels(endVal || new Date().toTimeString().slice(0, 5));
+    // 미지정이면 현재 시각(단, 시작 이전이면 시작+1분)에서 시작 — 휠 정렬되며 값 선택 (iOS와 동일)
+    var init = endVal;
+    if (!init) {{
+      var nowStr = new Date().toTimeString().slice(0, 5);
+      var st = startOfSelected();
+      init = (st && nowStr <= st) ? addMin(st, 1) : nowStr;
+    }}
+    positionWheels(init);
   }});
   document.getElementById('noend').addEventListener('click', function () {{
     setEndVal('');
@@ -1155,7 +1181,10 @@ def render_timeline(start_date: str, days: int, show_hidden: bool) -> str:
       var v = endVal;
       if (v) {{
         var st = selected.dataset.start || '';
-        if (st && v <= st && !confirm('익일 ' + v + ' 종료로 저장할까요?')) return;
+        if (st && v <= st) {{
+          alert('종료 시각은 시작(' + st + ') 이후여야 해요');
+          return;
+        }}
         seq = seq.then(function () {{ return api('/events/' + id + '/end', {{ end: v }}); }});
       }} else {{
         seq = seq.then(function () {{ return api('/events/' + id + '/end', {{ end: null }}); }});
