@@ -589,6 +589,34 @@ def _visible_minutes(b: dict) -> int:
     return int((b["end"] - b["start"]).total_seconds() // 60)
 
 
+def union_minutes(blocks: list[dict], clip_end: Optional[datetime] = None) -> int:
+    """기록된(비어있지 않고 숨겨지지 않은) 블록들의 구간 합집합 분. 커버리지 계산용.
+    병렬 활동이 겹치는 구간은 한 번만 세어 100%를 넘지 않게 한다."""
+    ivs = []
+    for b in blocks:
+        if b["empty"] or b["hidden"]:
+            continue
+        s, e = b["start"], b["end"]
+        if clip_end is not None:
+            e = min(e, clip_end)
+        if e > s:
+            ivs.append((s, e))
+    ivs.sort()
+    total = timedelta()
+    cs = ce = None
+    for s, e in ivs:
+        if cs is None:
+            cs, ce = s, e
+        elif s <= ce:
+            ce = max(ce, e)
+        else:
+            total += ce - cs
+            cs, ce = s, e
+    if cs is not None:
+        total += ce - cs
+    return int(total.total_seconds() // 60)
+
+
 def category_color(category: Optional[str]) -> str:
     if not category:
         return UNCATEGORIZED_COLOR

@@ -20,7 +20,7 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
 from app.constants import UNCATEGORIZED  # noqa: E402
-from app.main import _visible_minutes, build_blocks, now_kst  # noqa: E402
+from app.main import _visible_minutes, build_blocks, now_kst, union_minutes  # noqa: E402
 
 TAILSCALE_URL = "http://SERVER_HOST:8787"
 
@@ -85,8 +85,9 @@ def compose(date: str) -> str:
     d = _dt.strptime(date, "%Y-%m-%d")
     head = f"📅 {d.month}월 {d.day}일({weekdays[d.weekday()]}) 활동 브리핑"
 
+    blocks = build_blocks(date)
     totals: dict[str, int] = {}
-    for b in build_blocks(date):
+    for b in blocks:
         if b["empty"] or b["hidden"]:
             continue
         key = b["category"] or UNCATEGORIZED
@@ -96,7 +97,14 @@ def compose(date: str) -> str:
         return f"{head}\n\n기록이 없어요."
 
     recorded = sum(totals.values())
-    lines = [head, f"총 기록 {fmt_min(recorded)}", ""]
+    covered = union_minutes(blocks)  # 겹침(병렬 활동)은 한 번만 — 커버리지 지표
+    cov_pct = round(covered * 100 / (24 * 60))
+    lines = [
+        head,
+        f"총 기록 {fmt_min(recorded)}",
+        f"📊 커버리지 {cov_pct}% — 빈 시간 {fmt_min(24 * 60 - covered)}",
+        "",
+    ]
     for cat, m in sorted(totals.items(), key=lambda kv: -kv[1]):
         lines.append(f"· {cat} {fmt_min(m)}")
     kill = totals.get("킬링타임", 0)
