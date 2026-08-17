@@ -1,0 +1,26 @@
+#!/bin/sh
+# 민감정보 커밋 차단 훅.
+# 탐지: Tailscale CGNAT IP(100.64.0.0/10), 32자리 hex 토큰, 텔레그램 봇 토큰, 개인 이메일
+# 활성화: git config core.hooksPath scripts/git-hooks
+# 우회(오탐이 확실할 때만): git commit --no-verify
+#
+# 이 디렉터리(scripts/git-hooks) 자체는 검사에서 제외한다 —
+# 훅 파일에는 탐지 패턴 문자열이 들어 있어 자기 자신을 차단하게 되므로.
+
+TAILSCALE_IP='100\.(6[4-9]|[7-9][0-9]|1[01][0-9]|12[0-7])\.[0-9]{1,3}\.[0-9]{1,3}'
+HEX_TOKEN='[a-f0-9]{32}'
+TG_TOKEN='[0-9]{8,10}:AA[A-Za-z0-9_-]{20,}'
+EMAIL='code''0630@'
+PATTERN="$TAILSCALE_IP|$HEX_TOKEN|$TG_TOKEN|$EMAIL"
+
+files=$(git diff --cached --name-only --diff-filter=ACM | grep -v '^scripts/git-hooks/')
+[ -z "$files" ] && exit 0
+
+hits=$(git diff --cached --diff-filter=ACM -- $files | grep -E '^\+' | grep -E "$PATTERN")
+if [ -n "$hits" ]; then
+  printf '✋ 커밋 차단: 민감정보로 보이는 내용이 스테이징에 포함되어 있습니다:\n'
+  printf '%s\n' "$hits" | head -5
+  printf '(.env로 옮기세요. 오탐이 확실하면 git commit --no-verify)\n'
+  exit 1
+fi
+exit 0
