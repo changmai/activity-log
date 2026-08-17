@@ -28,6 +28,12 @@ LOG_PATH = ROOT / "logs" / "server.log"
 KST = ZoneInfo("Asia/Seoul")
 END_MARKERS = {"끝", "종료", "end"}
 
+# 타임블록 계산에서 제외되는 note 값. raw_text는 보존하되 화면·통계에서만 빠진다.
+#   consumed — 'X 끝' 마커가 활동에 매칭되어 end_ts로 반영됨
+#   merged   — 같은 활동의 중복 발화를 대표 기록 1건으로 합침
+SKIP_NOTES = ("consumed", "merged")
+SKIP_NOTES_SQL = "COALESCE(note, '') NOT IN ('consumed', 'merged')"
+
 DAY_START_HOUR = 0
 DAY_END_HOUR = 24
 TOTAL_MIN = (DAY_END_HOUR - DAY_START_HOUR) * 60
@@ -512,8 +518,8 @@ def build_blocks(date: str) -> list[dict]:
 
     events = []
     for row in rows:
-        if row["note"] == "consumed":
-            continue  # 매칭된 마커: 종료는 end_ts로 반영됨 — 시간 경계로 쓰지 않음
+        if (row["note"] or "") in SKIP_NOTES:
+            continue  # 매칭된 마커/합쳐진 중복 — 시간 경계로 쓰지 않음
         dt = parse_ts(row["effective_ts"] or row["ts"])
         if dt is not None:
             events.append((dt, row))
@@ -523,14 +529,14 @@ def build_blocks(date: str) -> list[dict]:
         last_coal = events[-1][0].isoformat() if events else day0.isoformat()
         nrow = conn.execute(
             "SELECT COALESCE(effective_ts, ts) AS c FROM events "
-            "WHERE COALESCE(effective_ts, ts) > ? AND COALESCE(note, '') != 'consumed' "
+            "WHERE COALESCE(effective_ts, ts) > ? AND " + SKIP_NOTES_SQL + " "
             "ORDER BY COALESCE(effective_ts, ts) LIMIT 1",
             (last_coal,),
         ).fetchone()
         global_next = parse_ts(nrow["c"]) if nrow else None
         prow = conn.execute(
             "SELECT * FROM events WHERE COALESCE(effective_ts, ts) < ? "
-            "AND COALESCE(note, '') != 'consumed' "
+            "AND " + SKIP_NOTES_SQL + " "
             "ORDER BY COALESCE(effective_ts, ts) DESC LIMIT 1",
             (day0.isoformat(),),
         ).fetchone()
