@@ -52,7 +52,12 @@ def main() -> int:
     # 마커 이벤트는 CLI 없이 처리
     cur = conn.execute(
         "UPDATE events SET category = '기타', tags = '[]' "
-        "WHERE category IS NULL AND lower(trim(raw_text)) IN ('끝', '종료', 'end')"
+        "WHERE category IS NULL AND ("
+        "  lower(trim(raw_text)) IN ('끝', '종료', 'end')"
+        "  OR trim(raw_text) LIKE '%끝'"
+        "  OR trim(raw_text) LIKE '%종료'"
+        "  OR lower(trim(raw_text)) LIKE '% end'"
+        ")"
     )
     if cur.rowcount:
         logger.info("마커 이벤트 %d건을 '기타'로 처리", cur.rowcount)

@@ -102,6 +102,13 @@ def now_kst() -> datetime:
     return datetime.now(KST)
 
 
+def is_end_marker(text: str) -> bool:
+    """종료 마커 판정: '끝'/'종료'/'end' 단독 또는 그 단어로 끝나는 문장.
+    예: "빨래 끝" → 해당 시각부터 빈 시간. 판정은 항상 raw_text 기준."""
+    t = text.strip().lower()
+    return t in END_MARKERS or t.endswith(("끝", "종료", " end"))
+
+
 class LogIn(BaseModel):
     text: str = ""
     ts: Optional[str] = None
@@ -319,7 +326,7 @@ def _compute_end(start: datetime, row: sqlite3.Row, nxt: Optional[datetime], now
         natural = max(start, min(now, own_day_end)) if now < own_day_end else own_day_end
         cap = own_day_end
     explicit = parse_ts(row["end_ts"]) if row["end_ts"] else None
-    is_empty = row["raw_text"].strip().lower() in END_MARKERS  # 마커 판정은 raw_text 고정
+    is_empty = is_end_marker(row["raw_text"])  # 마커 판정은 raw_text 고정
     has_explicit = explicit is not None and not is_empty
     # 명시적 종료의 상한은 분기와 무관: 사용자가 입력한 종료는 다음 기록이 며칠 뒤여도
     # 원본일 24:00으로 절단하지 않는다 (유령 이월 방지는 자동 연장에만 적용)
@@ -330,7 +337,7 @@ def _compute_end(start: datetime, row: sqlite3.Row, nxt: Optional[datetime], now
 
 def _make_block(row: sqlite3.Row, start: datetime, end: datetime, *, has_explicit: bool,
                 explicit: Optional[datetime], ongoing: bool, carry: bool) -> dict:
-    is_empty = row["raw_text"].strip().lower() in END_MARKERS
+    is_empty = is_end_marker(row["raw_text"])
     return {
         "id": row["id"],
         "start": start,
@@ -380,7 +387,7 @@ def build_blocks(date: str) -> list[dict]:
     # 이월(carry-over): 전날 마지막 이벤트가 D 00:00을 strict 하게 넘는 경우 (마커 블록은 제외)
     if prow is not None:
         pstart = parse_ts(prow["effective_ts"] or prow["ts"])
-        p_is_empty = prow["raw_text"].strip().lower() in END_MARKERS
+        p_is_empty = is_end_marker(prow["raw_text"])
         if pstart is not None and not p_is_empty:
             p_next = events[0][0] if events else global_next
             pend, p_has_exp, p_exp, p_natural = _compute_end(pstart, prow, p_next, now)
@@ -411,7 +418,7 @@ def build_blocks(date: str) -> list[dict]:
         end, has_explicit, explicit, natural = _compute_end(start, row, nxt, now)
         ongoing = (
             nxt is None and not has_explicit
-            and row["raw_text"].strip().lower() not in END_MARKERS
+            and not is_end_marker(row["raw_text"])
             and start < now < start + timedelta(hours=24)
         )
         blocks.append(_make_block(row, start, min(end, day1), has_explicit=has_explicit,
