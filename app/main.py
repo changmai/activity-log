@@ -981,7 +981,10 @@ def render_timeline(start_date: str, days: int, show_hidden: bool) -> str:
   var endtime = document.getElementById('endtime');
 
   edittext.addEventListener('input', function () {{ dirty.text = true; }});
-  editcat.addEventListener('change', function () {{ dirty.cat = true; }});
+  edittext.addEventListener('keydown', function (e) {{
+    if (e.key === 'Enter') {{ e.preventDefault(); saveAll(); }}  // 엔터로 바로 저장
+  }});
+  editcat.addEventListener('change', function () {{ dirty.cat = true; saveAll(); }});  // 선택 즉시 저장
   endtime.addEventListener('input', function () {{ dirty.end = true; }});
   endtime.addEventListener('change', function () {{ dirty.end = true; }});
 
@@ -1031,7 +1034,7 @@ def render_timeline(start_date: str, days: int, show_hidden: bool) -> str:
     }});
   }}
 
-  document.getElementById('endsave').addEventListener('click', function () {{
+  function saveAll() {{
     if (!selected) return;
     var id = selected.dataset.id;
     var seq = Promise.resolve();
@@ -1056,7 +1059,8 @@ def render_timeline(start_date: str, days: int, show_hidden: bool) -> str:
     if (!dirty.text && !dirty.cat && !dirty.end) {{ closeEdit(); return; }}
     seq.then(function () {{ location.reload(); }})
        .catch(function (e) {{ alert(e.message); }});
-  }});
+  }}
+  document.getElementById('endsave').addEventListener('click', saveAll);
 
   document.getElementById('hidebtn').addEventListener('click', function () {{
     if (!selected) return;
