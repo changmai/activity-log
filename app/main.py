@@ -119,38 +119,45 @@ def _normalize_text(t: str) -> str:
 
 
 def match_marker_to_activity(text: str, marker_ts: datetime) -> Optional[int]:
-    """'X 끝' 마커의 X가 직전 열려있는 활동과 (띄어쓰기 무시) 동일/유사하면
+    """'X 끝' 마커의 X와 (띄어쓰기 무시) 동일/유사한 열린 활동을 찾아
     그 활동의 end_ts를 마커 시각으로 확정하고 이벤트 id를 반환.
 
     매칭 조건: 정규화 후 동일, 포함 관계, 또는 유사도 ≥ 0.75.
-    대상은 '가장 최근의 비마커 이벤트' 1건 (end_ts 미설정, 24h 이내)만 — 병렬 활동 매칭은 추후.
+    병렬 활동 지원: 직전 1건이 아니라 최근 24h 내 열린 활동들을 최신순으로 거슬러
+    올라가며 텍스트가 맞는 첫 활동을 닫는다 (예: 설거지 → 밥 먹기 → "설거지 끝").
     """
     m = _MARKER_SUFFIX_RE.match(text.strip())
     base = m.group(1).strip() if m else ""
     if not base:
         return None  # 단독 "끝" — 매칭 대상 없음
     with get_db() as conn:
-        prev = conn.execute(
+        candidates = conn.execute(
             "SELECT * FROM events WHERE COALESCE(effective_ts, ts) < ? "
-            "ORDER BY COALESCE(effective_ts, ts) DESC, id DESC LIMIT 1",
-            (marker_ts.isoformat(timespec="seconds"),),
-        ).fetchone()
-        if prev is None or is_end_marker(prev["raw_text"]) or prev["end_ts"] or prev["hidden"]:
-            return None
-        prev_start = parse_ts(prev["effective_ts"] or prev["ts"])
-        if prev_start is None or not (prev_start < marker_ts <= prev_start + timedelta(hours=24)):
-            return None
+            "AND COALESCE(effective_ts, ts) >= ? "
+            "ORDER BY COALESCE(effective_ts, ts) DESC, id DESC LIMIT 30",
+            (
+                marker_ts.isoformat(timespec="seconds"),
+                (marker_ts - timedelta(hours=24)).isoformat(timespec="seconds"),
+            ),
+        ).fetchall()
         a = _normalize_text(base)
-        b = _normalize_text(prev["display_text"] or prev["raw_text"])
-        if not (a == b or a in b or b in a or SequenceMatcher(None, a, b).ratio() >= 0.75):
-            return None
-        conn.execute(
-            "UPDATE events SET end_ts = ? WHERE id = ?",
-            (marker_ts.isoformat(timespec="seconds"), prev["id"]),
-        )
-        logger.info("marker match: '%s' → id=%s end_ts=%s", base, prev["id"],
-                    marker_ts.isoformat(timespec="seconds"))
-        return prev["id"]
+        for prev in candidates:
+            if is_end_marker(prev["raw_text"]) or prev["end_ts"] or prev["hidden"]:
+                continue
+            prev_start = parse_ts(prev["effective_ts"] or prev["ts"])
+            if prev_start is None or not (prev_start < marker_ts <= prev_start + timedelta(hours=24)):
+                continue
+            b = _normalize_text(prev["display_text"] or prev["raw_text"])
+            if not (a == b or a in b or b in a or SequenceMatcher(None, a, b).ratio() >= 0.75):
+                continue
+            conn.execute(
+                "UPDATE events SET end_ts = ? WHERE id = ?",
+                (marker_ts.isoformat(timespec="seconds"), prev["id"]),
+            )
+            logger.info("marker match: '%s' → id=%s end_ts=%s", base, prev["id"],
+                        marker_ts.isoformat(timespec="seconds"))
+            return prev["id"]
+        return None
 
 
 class LogIn(BaseModel):
@@ -176,12 +183,15 @@ def post_log(body: LogIn, x_token: str = Header(default="")):
     ts_dt = parsed or now_kst()
     ts = ts_dt.isoformat(timespec="seconds")
     received_at = now_kst().isoformat(timespec="seconds")
-    # "X 끝" 마커면 직전 활동 X의 종료 시각으로 확정 기록 시도
+    # "X 끝" 마커면 열린 활동 X의 종료 시각으로 확정 기록 시도
     matched_id = match_marker_to_activity(text, ts_dt) if is_end_marker(text) else None
+    # 매칭에 성공한 마커는 note='consumed' — end_ts로 이미 반영됐으므로 타임블록
+    # 경계로 쓰지 않는다 (병렬 활동: "설거지 끝"이 진행 중인 다른 활동을 자르면 안 됨)
     with get_db() as conn:
         cur = conn.execute(
-            "INSERT INTO events (ts, received_at, raw_text, source) VALUES (?, ?, ?, ?)",
-            (ts, received_at, text, body.source or "voice"),
+            "INSERT INTO events (ts, received_at, raw_text, source, note) VALUES (?, ?, ?, ?, ?)",
+            (ts, received_at, text, body.source or "voice",
+             "consumed" if matched_id is not None else None),
         )
     logger.info("log id=%s source=%s text=%s", cur.lastrowid, body.source, text)
     return {"ok": True, "id": cur.lastrowid, "ts": ts, "matched_end": matched_id}
@@ -246,6 +256,52 @@ def set_event_end(event_id: int, body: EndIn, x_requested_with: str = Header(def
         conn.execute("UPDATE events SET end_ts = ? WHERE id = ?", (end_iso, event_id))
     logger.info("end set id=%s end_ts=%s", event_id, end_iso)
     return {"ok": True, "end_ts": end_iso}
+
+
+class StartIn(BaseModel):
+    start: Optional[str] = None  # "HH:MM" (이벤트 당일 기준), null이면 effective_ts 해제(원래 시각 복원)
+
+
+@app.post("/events/{event_id}/start")
+def set_event_start(event_id: int, body: StartIn, x_requested_with: str = Header(default="")):
+    if err := _ui_forbidden(x_requested_with):
+        return err
+    with get_db() as conn:
+        row, err = _get_event_or_404(conn, event_id)
+        if err:
+            return err
+        if body.start is None:
+            conn.execute("UPDATE events SET effective_ts = NULL WHERE id = ?", (event_id,))
+            logger.info("start cleared id=%s", event_id)
+            return {"ok": True, "effective_ts": None}
+        cur_start = parse_ts(row["effective_ts"] or row["ts"])
+        if cur_start is None:
+            return JSONResponse({"ok": False, "error": "이벤트 시각을 해석할 수 없음"}, status_code=400)
+        value = body.start.strip()
+        if len(value) == 5 and value[2] == ":":  # HH:MM → 이벤트 당일 날짜와 결합
+            try:
+                hh, mm = int(value[:2]), int(value[3:5])
+            except ValueError:
+                return JSONResponse({"ok": False, "error": "잘못된 시각 형식"}, status_code=400)
+            if hh > 23 or mm > 59:
+                return JSONResponse({"ok": False, "error": "잘못된 시각 형식"}, status_code=400)
+            new_start = cur_start.replace(hour=hh, minute=mm, second=0, microsecond=0)
+        else:
+            new_start = parse_ts(value)
+        if new_start is None:
+            return JSONResponse({"ok": False, "error": "잘못된 시각 형식"}, status_code=400)
+        end = parse_ts(row["end_ts"]) if row["end_ts"] else None
+        if end is not None:
+            if new_start >= end:
+                return JSONResponse(
+                    {"ok": False, "error": "시작 시각이 종료 시각보다 늦어요"}, status_code=400)
+            if end - new_start > timedelta(hours=18):
+                return JSONResponse(
+                    {"ok": False, "error": "18시간을 넘는 활동은 저장할 수 없어요"}, status_code=400)
+        start_iso = new_start.isoformat(timespec="seconds")
+        conn.execute("UPDATE events SET effective_ts = ? WHERE id = ?", (start_iso, event_id))
+    logger.info("start set id=%s effective_ts=%s", event_id, start_iso)
+    return {"ok": True, "effective_ts": start_iso}
 
 
 class CategoryIn(BaseModel):
@@ -375,10 +431,9 @@ def _compute_end(start: datetime, row: sqlite3.Row, nxt: Optional[datetime], now
     explicit = parse_ts(row["end_ts"]) if row["end_ts"] else None
     is_empty = is_end_marker(row["raw_text"])  # 마커 판정은 raw_text 고정
     has_explicit = explicit is not None and not is_empty
-    # 명시적 종료의 상한은 분기와 무관: 사용자가 입력한 종료는 다음 기록이 며칠 뒤여도
-    # 원본일 24:00으로 절단하지 않는다 (유령 이월 방지는 자동 연장에만 적용)
-    exp_cap = min(nxt, limit) if nxt is not None else limit
-    end = min(max(explicit, start), exp_cap) if has_explicit else natural
+    # 명시적 종료는 start+24h만 상한 — 다음 이벤트 시작으로 절단하지 않는다.
+    # 병렬 활동 지원: 설거지(12:00~12:30 확정)와 밥 먹기(12:05~)가 겹쳐 표시되어야 함
+    end = min(max(explicit, start), limit) if has_explicit else natural
     return end, has_explicit, explicit, natural
 
 
@@ -410,6 +465,8 @@ def build_blocks(date: str) -> list[dict]:
 
     events = []
     for row in rows:
+        if row["note"] == "consumed":
+            continue  # 매칭된 마커: 종료는 end_ts로 반영됨 — 시간 경계로 쓰지 않음
         dt = parse_ts(row["effective_ts"] or row["ts"])
         if dt is not None:
             events.append((dt, row))
@@ -419,12 +476,14 @@ def build_blocks(date: str) -> list[dict]:
         last_coal = events[-1][0].isoformat() if events else day0.isoformat()
         nrow = conn.execute(
             "SELECT COALESCE(effective_ts, ts) AS c FROM events "
-            "WHERE COALESCE(effective_ts, ts) > ? ORDER BY COALESCE(effective_ts, ts) LIMIT 1",
+            "WHERE COALESCE(effective_ts, ts) > ? AND COALESCE(note, '') != 'consumed' "
+            "ORDER BY COALESCE(effective_ts, ts) LIMIT 1",
             (last_coal,),
         ).fetchone()
         global_next = parse_ts(nrow["c"]) if nrow else None
         prow = conn.execute(
             "SELECT * FROM events WHERE COALESCE(effective_ts, ts) < ? "
+            "AND COALESCE(note, '') != 'consumed' "
             "ORDER BY COALESCE(effective_ts, ts) DESC LIMIT 1",
             (day0.isoformat(),),
         ).fetchone()
@@ -753,8 +812,8 @@ def render_timeline(start_date: str, days: int, show_hidden: bool) -> str:
   .block {{ position: absolute; left: 2px; right: 2px; border-radius: 7px; padding: 2px 7px;
             font-size: 12px; line-height: 1.35; font-weight: 600; overflow: hidden; z-index: 1;
             transition: box-shadow .18s ease; }}
-  .block.empty {{ background: #e3e3e8; color: #6e6e76;
-                  border-left: 3px solid #c7c7cd; font-weight: 500; }}
+  .block.empty {{ background: #c9c9d0; color: #47474f;
+                  border-left: 3px solid #9f9fa8; font-weight: 500; }}
   .block.hiddenblk {{ opacity: .45; }}
   .block.focus {{ height: auto !important; min-height: 22px; z-index: 5;
                   left: 2px !important; right: 2px !important; width: auto !important;
@@ -806,10 +865,10 @@ def render_timeline(start_date: str, days: int, show_hidden: bool) -> str:
             padding: 0 10px; }}
   .tlabel {{ font-size: 10px; font-weight: 600; color: var(--muted);
              text-transform: uppercase; letter-spacing: .04em; }}
-  #editstart {{ font-size: 16px; font-weight: 600; color: var(--text);
+  #editstart {{ font-size: 16px; font-weight: 600; color: var(--accent);
                 font-variant-numeric: tabular-nums; line-height: 1.3; }}
   .tarrow {{ color: var(--muted); font-size: 14px; padding-bottom: 2px; }}
-  #endcell {{ cursor: pointer; }}
+  #startcell, #endcell {{ cursor: pointer; }}
   #enddisp {{ font-size: 16px; font-weight: 600; color: var(--accent);
               font-variant-numeric: tabular-nums; line-height: 1.3; }}
   /* iOS 시계 휠 피커: 스크롤 스냅 드럼 2개 + 중앙 하이라이트 밴드 */
@@ -867,7 +926,7 @@ def render_timeline(start_date: str, days: int, show_hidden: bool) -> str:
   </div>
   <div class="ebrow">
     <div id="timerange">
-      <div class="tcell"><span class="tlabel">시작</span><span id="editstart">–</span></div>
+      <div class="tcell" id="startcell"><span class="tlabel">시작</span><span id="editstart">–</span></div>
       <div class="tarrow">→</div>
       <div class="tcell" id="endcell"><span class="tlabel">종료</span>
         <span id="enddisp">–</span>
@@ -1033,23 +1092,28 @@ def render_timeline(start_date: str, days: int, show_hidden: bool) -> str:
   var edittext = document.getElementById('edittext');
   var editcat = document.getElementById('editcat');
 
-  // ---- iOS 스타일 시계 휠 피커 ----
+  // ---- iOS 스타일 시계 휠 피커 (시작/종료 겸용) ----
+  var editstart = document.getElementById('editstart');
   var enddisp = document.getElementById('enddisp');
   var wheelbox = document.getElementById('wheelbox');
+  var noendBtn = document.getElementById('noend');
   var wh = document.getElementById('wh');
   var wm = document.getElementById('wm');
   var WI = 36;                 // 휠 항목 높이(px)
+  var startVal = '';           // 'HH:MM'
   var endVal = '';             // '' = 종료 미지정, 'HH:MM'
+  var editTarget = 'end';      // 휠이 편집 중인 대상: 'start' | 'end'
   var cur = {{ h: 0, m: 0 }};
 
   function pad2(n) {{ return String(n).padStart(2, '0'); }}
   function addMin(hhmm, delta) {{
-    var t = Math.min(parseInt(hhmm.slice(0, 2), 10) * 60 + parseInt(hhmm.slice(3, 5), 10) + delta,
-                     23 * 60 + 59);
+    var t = parseInt(hhmm.slice(0, 2), 10) * 60 + parseInt(hhmm.slice(3, 5), 10) + delta;
+    t = Math.max(0, Math.min(t, 23 * 60 + 59));
     return pad2(Math.floor(t / 60)) + ':' + pad2(t % 60);
   }}
-  function startOfSelected() {{
-    return (selected && selected.dataset.start) || '';
+  function setStartVal(v) {{
+    startVal = v;
+    editstart.textContent = v || '–';
   }}
   function setEndVal(v) {{
     endVal = v;
@@ -1067,22 +1131,35 @@ def render_timeline(start_date: str, days: int, show_hidden: bool) -> str:
       if (t) clearTimeout(t);
       t = setTimeout(function () {{
         var idx = Math.max(0, Math.min(Math.round(el.scrollTop / WI), el.children.length - 1));
-        if (cur[part] === idx && endVal) return;  // 위치 이동만으로는 변경 아님
+        var curVal = editTarget === 'end' ? endVal : startVal;
+        if (cur[part] === idx && curVal) return;  // 위치 이동만으로는 변경 아님
         var cand = {{ h: cur.h, m: cur.m }};
         cand[part] = idx;
         var candVal = pad2(cand.h) + ':' + pad2(cand.m);
-        var st = startOfSelected();
-        if (st && candVal <= st) {{
-          // 시작 이전 시각은 허용하지 않음 — 알림 후 유효한 값으로 되돌림
-          alert('종료 시각은 시작(' + st + ') 이후여야 해요');
-          var back = (endVal && endVal > st) ? endVal : addMin(st, 1);
-          setEndVal(back);
-          positionWheels(back);
-          return;
+        if (editTarget === 'end') {{
+          if (startVal && candVal <= startVal) {{
+            // 시작 이전 시각은 허용하지 않음 — 알림 후 유효한 값으로 되돌림
+            alert('종료 시각은 시작(' + startVal + ') 이후여야 해요');
+            var back = (endVal && endVal > startVal) ? endVal : addMin(startVal, 1);
+            setEndVal(back);
+            positionWheels(back);
+            return;
+          }}
+          cur[part] = idx;
+          setEndVal(candVal);
+          dirty.end = true;
+        }} else {{
+          if (endVal && candVal >= endVal) {{
+            alert('시작 시각은 종료(' + endVal + ') 이전이어야 해요');
+            var back2 = (startVal && startVal < endVal) ? startVal : addMin(endVal, -1);
+            setStartVal(back2);
+            positionWheels(back2);
+            return;
+          }}
+          cur[part] = idx;
+          setStartVal(candVal);
+          dirty.start = true;
         }}
-        cur[part] = idx;
-        setEndVal(candVal);
-        dirty.end = true;
       }}, 130);
     }});
     el.addEventListener('click', function (e) {{
@@ -1094,19 +1171,27 @@ def render_timeline(start_date: str, days: int, show_hidden: bool) -> str:
   bindWheel(wh, 'h');
   bindWheel(wm, 'm');
 
-  document.getElementById('endcell').addEventListener('click', function () {{
-    if (!wheelbox.hidden) {{ wheelbox.hidden = true; return; }}
+  function openWheel(target) {{
+    if (!wheelbox.hidden && editTarget === target) {{ wheelbox.hidden = true; return; }}
+    editTarget = target;
+    noendBtn.hidden = target !== 'end';  // '종료 시각 없음'은 종료 편집일 때만
     wheelbox.hidden = false;
-    // 미지정이면 현재 시각(단, 시작 이전이면 시작+1분)에서 시작 — 휠 정렬되며 값 선택 (iOS와 동일)
-    var init = endVal;
-    if (!init) {{
-      var nowStr = new Date().toTimeString().slice(0, 5);
-      var st = startOfSelected();
-      init = (st && nowStr <= st) ? addMin(st, 1) : nowStr;
+    var init;
+    if (target === 'end') {{
+      // 미지정이면 현재 시각(단, 시작 이전이면 시작+1분)에서 시작 — 휠 정렬되며 값 선택 (iOS와 동일)
+      init = endVal;
+      if (!init) {{
+        var nowStr = new Date().toTimeString().slice(0, 5);
+        init = (startVal && nowStr <= startVal) ? addMin(startVal, 1) : nowStr;
+      }}
+    }} else {{
+      init = startVal || new Date().toTimeString().slice(0, 5);
     }}
     positionWheels(init);
-  }});
-  document.getElementById('noend').addEventListener('click', function () {{
+  }}
+  document.getElementById('endcell').addEventListener('click', function () {{ openWheel('end'); }});
+  document.getElementById('startcell').addEventListener('click', function () {{ openWheel('start'); }});
+  noendBtn.addEventListener('click', function () {{
     setEndVal('');
     dirty.end = true;
     wheelbox.hidden = true;
@@ -1120,8 +1205,8 @@ def render_timeline(start_date: str, days: int, show_hidden: bool) -> str:
 
   function openEdit(b) {{
     selected = b;
-    dirty = {{ text: false, cat: false, end: false }};
-    document.getElementById('editstart').textContent = b.dataset.start || '–';
+    dirty = {{ text: false, cat: false, end: false, start: false }};
+    setStartVal(b.dataset.start || '');
     edittext.value = b.dataset.text || '';
     editcat.value = b.dataset.category || '';
     setEndVal(b.dataset.end || '');
@@ -1177,12 +1262,20 @@ def render_timeline(start_date: str, days: int, show_hidden: bool) -> str:
       var c = editcat.value;
       seq = seq.then(function () {{ return api('/events/' + id + '/category', {{ category: c || null }}); }});
     }}
+    if (dirty.start) {{
+      var sv = startVal;
+      if (!sv) {{ alert('시작 시각이 비어 있어요'); return; }}
+      if (endVal && endVal <= sv) {{
+        alert('시작 시각은 종료(' + endVal + ') 이전이어야 해요');
+        return;
+      }}
+      seq = seq.then(function () {{ return api('/events/' + id + '/start', {{ start: sv }}); }});
+    }}
     if (dirty.end) {{
       var v = endVal;
       if (v) {{
-        var st = selected.dataset.start || '';
-        if (st && v <= st) {{
-          alert('종료 시각은 시작(' + st + ') 이후여야 해요');
+        if (startVal && v <= startVal) {{
+          alert('종료 시각은 시작(' + startVal + ') 이후여야 해요');
           return;
         }}
         seq = seq.then(function () {{ return api('/events/' + id + '/end', {{ end: v }}); }});
@@ -1190,7 +1283,7 @@ def render_timeline(start_date: str, days: int, show_hidden: bool) -> str:
         seq = seq.then(function () {{ return api('/events/' + id + '/end', {{ end: null }}); }});
       }}
     }}
-    if (!dirty.text && !dirty.cat && !dirty.end) {{ closeEdit(); return; }}
+    if (!dirty.text && !dirty.cat && !dirty.end && !dirty.start) {{ closeEdit(); return; }}
     seq.then(function () {{ location.reload(); }})
        .catch(function (e) {{ alert(e.message); }});
   }}
