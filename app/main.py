@@ -506,6 +506,16 @@ def _tint(color: str, alpha: float) -> str:
     return f"rgba({r},{g},{b},{alpha})"
 
 
+def _tint_solid(color: str, t: float) -> str:
+    """흰색과 혼합한 불투명 틴트 — rgba와 같은 색감이지만 뒤 블록이 비치지 않음."""
+    r, g, b = _rgb(color)
+    return "#%02x%02x%02x" % (
+        int(r * t + 255 * (1 - t)),
+        int(g * t + 255 * (1 - t)),
+        int(b * t + 255 * (1 - t)),
+    )
+
+
 def _shade(color: str, f: float = 0.38) -> str:
     """카테고리 색을 어둡게 — 틴트 배경 위 텍스트용 (애플 캘린더 방식)."""
     r, g, b = _rgb(color)
@@ -575,9 +585,9 @@ def render_day_column(date: str, blocks: list[dict], show_hidden: bool) -> str:
             cls = "block " + ("fixedend" if b["explicit_end"] else "auto")
             if b["hidden"]:
                 cls += " hiddenblk"
-            # 애플 캘린더 스타일: 틴트 배경 + 좌측 컬러 바 + 진한 컬러 텍스트
+            # 애플 캘린더 스타일: 틴트 배경(불투명 — 겹침/선택 시 뒤가 비치지 않게) + 좌측 컬러 바 + 진한 컬러 텍스트
             style = (
-                f"background:{_tint(color, 0.16)};color:{_shade(color)};"
+                f"background:{_tint_solid(color, 0.16)};color:{_shade(color)};"
                 f"border-left:3px solid {color};"
             )
             if b["explicit_end"]:
@@ -741,8 +751,8 @@ def render_timeline(start_date: str, days: int, show_hidden: bool) -> str:
   .block {{ position: absolute; left: 2px; right: 2px; border-radius: 7px; padding: 2px 7px;
             font-size: 12px; line-height: 1.35; font-weight: 600; overflow: hidden; z-index: 1;
             transition: box-shadow .18s ease; }}
-  .block.empty {{ background: rgba(120,120,128,.07); color: #a9a9af;
-                  border-left: 3px solid rgba(120,120,128,.2); font-weight: 500; }}
+  .block.empty {{ background: #f4f4f5; color: #a9a9af;
+                  border-left: 3px solid #e2e2e5; font-weight: 500; }}
   .block.hiddenblk {{ opacity: .45; }}
   .block.focus {{ height: auto !important; min-height: 22px; z-index: 5;
                   left: 2px !important; right: 2px !important; width: auto !important;
