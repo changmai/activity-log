@@ -1,0 +1,406 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>활동 타임라인</title>
+<script src="/static/fullcalendar.min.js"></script>
+<script src="/static/fc-ko.min.js"></script>
+<style>
+  :root {
+    --accent: #2563eb;
+    --text: #1f2328;
+    --muted: #6b7280;
+    --line: #eceef1;
+    --radius: 10px;
+  }
+  * { box-sizing: border-box; }
+  html { overscroll-behavior-y: contain; }
+  body { font-family: "Pretendard Variable", Pretendard, -apple-system, BlinkMacSystemFont,
+                      "Apple SD Gothic Neo", "Noto Sans KR", "Segoe UI", "Malgun Gothic", sans-serif;
+         margin: 0; background: #fff; color: var(--text);
+         height: 100dvh; display: flex; flex-direction: column; overflow: hidden;
+         -webkit-font-smoothing: antialiased; letter-spacing: -0.01em; }
+  .topbar { flex: none; background: #fff; border-bottom: 1px solid var(--line); padding: 10px 12px 8px; }
+  .controls { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
+  .controls button.nav { border: none; background: none; color: var(--muted); font-size: 16px;
+                         padding: 6px 10px; cursor: pointer; border-radius: 8px; }
+  .controls button.nav:active { background: #f3f4f6; }
+  .controls input[type=date], .controls select, .controls .todaybtn, .zoom button {
+    height: 36px; font-size: 14px; border: 1px solid var(--line); border-radius: var(--radius);
+    background: #fff; color: var(--text); padding: 0 10px; }
+  .controls input[type=date] { font-variant-numeric: tabular-nums; }
+  .controls .todaybtn { color: var(--accent); font-weight: 600; cursor: pointer; }
+  .controls .todaybtn:active { background: #eff6ff; }
+  .zoom { margin-left: auto; display: flex; gap: 4px; }
+  .zoom button { width: 36px; padding: 0; font-size: 18px; color: var(--muted); cursor: pointer; }
+  .zoom button:active { background: #f3f4f6; }
+  #totals { padding-top: 8px; display: flex; flex-wrap: wrap; gap: 6px; }
+  .chip { border-radius: 999px; padding: 3px 10px; font-size: 12.5px; font-weight: 600;
+          white-space: nowrap; border: 1px solid transparent; }
+  #calendar { flex: 1; min-height: 0; padding: 0 6px 4px; touch-action: pan-y; }
+
+  /* FullCalendar 테마 정리 */
+  .fc { --fc-border-color: var(--line); --fc-today-bg-color: rgba(37,99,235,.04);
+        --fc-now-indicator-color: #ef4444; }
+  .fc .fc-timegrid-slot { height: var(--slot-h, 48px); }
+  .fc .fc-col-header-cell-cushion { font-size: 13px; font-weight: 600; color: var(--text);
+                                    padding: 8px 4px; text-decoration: none; }
+  .fc .fc-day-today .fc-col-header-cell-cushion { color: var(--accent); }
+  .fc .fc-timegrid-slot-label-cushion { font-size: 11px; color: var(--muted);
+                                        font-variant-numeric: tabular-nums; }
+  .fc-theme-standard .fc-scrollgrid { border: none; }
+  .fc .fc-timegrid-event { border-radius: 8px; box-shadow: 0 1px 2px rgba(0,0,0,.12);
+                           border: none; padding: 1px 2px; }
+  .fc .fc-event-main { font-size: 12px; line-height: 1.35; overflow: hidden; font-weight: 500; }
+  .fc .fc-event-time { font-weight: 700; font-variant-numeric: tabular-nums; }
+  .fc-direction-ltr .fc-timegrid-col-events { margin-right: 2px; }
+  /* 종료 확정(실선) vs 자동 연장(점선) */
+  .evt-fixed { border-bottom: 3px solid rgba(0,0,0,.3) !important; }
+  .evt-auto { border-bottom: 1px dashed rgba(0,0,0,.55) !important; }
+  .evt-empty { background: repeating-linear-gradient(45deg, #f6f7f8, #f6f7f8 8px, #eceef1 8px, #eceef1 16px) !important;
+               border: 1px solid var(--line) !important; box-shadow: none !important; }
+  .evt-empty .fc-event-main { color: #9aa1a9 !important; }
+  /* 핀치 중 글자 크기 고정 (박스는 scaleY, 글자는 역배율) */
+  html.pinching .fc-event-main,
+  html.pinching .fc-timegrid-slot-label-cushion { transform: scaleY(var(--isy, 1)); transform-origin: 0 0; display: inline-block; }
+  html.pinching .fc-event-main { display: block; }
+
+  #editbar { position: fixed; left: 0; right: 0; bottom: 0; z-index: 30; background: #fff;
+             border-top: 1px solid var(--line); box-shadow: 0 -4px 16px rgba(0,0,0,.07);
+             display: flex; align-items: center; gap: 8px; padding: 10px 12px;
+             padding-bottom: calc(10px + env(safe-area-inset-bottom)); }
+  #editbar[hidden] { display: none; }
+  #editlabel { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis;
+               white-space: nowrap; font-size: 13px; color: var(--text); font-weight: 500; }
+  #editbar .endlabel { font-size: 13px; color: var(--muted); white-space: nowrap; }
+  #editbar input[type=time] { font-size: 15px; padding: 4px 8px; border: 1px solid var(--line);
+                              border-radius: var(--radius); min-width: 92px; min-height: 36px;
+                              background: #fff; color: var(--text);
+                              -webkit-appearance: none; appearance: none;
+                              font-variant-numeric: tabular-nums; }
+  #editbar button { font-size: 14px; padding: 8px 12px; border: 1px solid var(--line);
+                    border-radius: var(--radius); background: #fff; white-space: nowrap;
+                    cursor: pointer; color: var(--text); font-weight: 500; }
+  #editbar #endsave { background: var(--accent); color: #fff; border-color: var(--accent); font-weight: 600; }
+</style>
+</head>
+<body>
+<div class="topbar">
+  <div class="controls">
+    <button class="nav" id="prevbtn">◀</button>
+    <input type="date" id="datepick">
+    <button class="nav" id="nextbtn">▶</button>
+    <select id="dayspick"></select>
+    <button class="todaybtn" id="todaybtn">오늘</button>
+    <button class="todaybtn" id="gotonow">현재</button>
+    <div class="zoom">
+      <button id="zoomout" aria-label="축소">−</button>
+      <button id="zoomin" aria-label="확대">＋</button>
+    </div>
+  </div>
+  <div id="totals"></div>
+</div>
+<div id="calendar"></div>
+<div id="editbar" hidden>
+  <span id="editlabel"></span>
+  <label class="endlabel" for="endtime">종료</label>
+  <input type="time" id="endtime">
+  <button id="endsave">종료 저장</button>
+  <button id="endclear">해제</button>
+</div>
+<script>
+(function () {
+  var root = document.documentElement;
+  var MIN_H = 20, MAX_H = 300;  // 30분 슬롯 높이(px) 범위 (최소에서도 하루가 화면보다 짧아지지 않게)
+  function clampH(h) { return Math.min(MAX_H, Math.max(MIN_H, h)); }
+
+  var qs = new URLSearchParams(location.search);
+  var DAYS = parseInt(qs.get('days')) || parseInt(localStorage.getItem('fc_days')) || 1;
+  DAYS = Math.min(7, Math.max(1, DAYS));
+  var slotH = clampH(parseFloat(localStorage.getItem('fc_slotH')) || 48);
+  root.style.setProperty('--slot-h', slotH + 'px');
+
+  var sel = document.getElementById('dayspick');
+  for (var n = 1; n <= 7; n++) {
+    var o = document.createElement('option');
+    o.value = n; o.textContent = n + '일';
+    if (n === DAYS) o.selected = true;
+    sel.appendChild(o);
+  }
+
+  var views = {};
+  for (var i = 1; i <= 7; i++) views['d' + i] = { type: 'timeGrid', duration: { days: i } };
+
+  var calEl = document.getElementById('calendar');
+  var calendar = new FullCalendar.Calendar(calEl, {
+    locale: 'ko',
+    headerToolbar: false,
+    views: views,
+    initialView: 'd' + DAYS,
+    initialDate: qs.get('date') || undefined,
+    allDaySlot: false,
+    slotMinTime: '06:00:00',
+    slotMaxTime: '24:00:00',
+    slotDuration: '00:30:00',
+    nowIndicator: true,
+    height: '100%',
+    expandRows: false,
+    navLinks: true,
+    navLinkDayClick: function (date) {
+      DAYS = 1; sel.value = '1'; localStorage.setItem('fc_days', '1');
+      calendar.changeView('d1', date);
+    },
+    dayHeaderFormat: { month: 'numeric', day: 'numeric', weekday: 'short' },
+    eventTimeFormat: { hour: '2-digit', minute: '2-digit', hour12: false },
+    slotLabelFormat: { hour: '2-digit', hour12: false },
+    scrollTime: (function () {
+      var h = Math.max(6, new Date().getHours() - 2);
+      return String(h).padStart(2, '0') + ':00:00';
+    })(),
+    events: function (info, success, failure) {
+      fetch('/api/blocks?start=' + info.startStr.slice(0, 10) + '&end=' + info.endStr.slice(0, 10))
+        .then(function (r) { return r.json(); })
+        .then(function (d) { renderTotals(d.totals, d.colors); success(d.events); })
+        .catch(failure);
+    },
+    eventDidMount: function (arg) { arg.el.title = arg.event.title; },
+    eventClick: function (info) {
+      if (Date.now() - lastPinchEnd < 400) return;
+      if (info.event.extendedProps.empty || !info.event.id) return;
+      selected = info.event;
+      document.getElementById('editlabel').textContent =
+        info.event.start.toTimeString().slice(0, 5) + ' ' + info.event.title;
+      var nowStr = new Date().toTimeString().slice(0, 5);
+      document.getElementById('endtime').value = info.event.extendedProps.endHHMM || nowStr;
+      editbar.hidden = false;
+    },
+    datesSet: function (info) {
+      document.getElementById('datepick').value = info.startStr.slice(0, 10);
+      history.replaceState(null, '', '/timeline?date=' + info.startStr.slice(0, 10) + '&days=' + DAYS);
+    },
+  });
+  calendar.render();
+
+  // ---------- 상단 컨트롤 ----------
+  document.getElementById('prevbtn').addEventListener('click', function () { calendar.prev(); });
+  document.getElementById('nextbtn').addEventListener('click', function () { calendar.next(); });
+  document.getElementById('todaybtn').addEventListener('click', function () { calendar.today(); });
+  document.getElementById('datepick').addEventListener('change', function () {
+    if (this.value) calendar.gotoDate(this.value);
+  });
+  sel.addEventListener('change', function () {
+    DAYS = parseInt(this.value);
+    localStorage.setItem('fc_days', DAYS);
+    calendar.changeView('d' + DAYS);
+  });
+  document.getElementById('gotonow').addEventListener('click', function () {
+    calendar.today();
+    var sc = getScroller();
+    if (!sc) return;
+    var now = new Date();
+    var min = (now.getHours() - 6) * 60 + now.getMinutes();
+    var px = (min / 30) * slotH;
+    sc.scrollTo({ top: Math.max(0, px - sc.clientHeight / 2), behavior: 'smooth' });
+  });
+
+  function renderTotals(totals, colors) {
+    var box = document.getElementById('totals');
+    box.innerHTML = '';
+    var keys = Object.keys(totals).sort(function (a, b) { return totals[b] - totals[a]; });
+    if (!keys.length) keys = null;
+    (keys || ['기록 없음']).forEach(function (k) {
+      var span = document.createElement('span');
+      span.className = 'chip';
+      var c = (colors && colors[k]) || '#9aa0a6';
+      // 연한 틴트 배경 + 진한 글자색 (원색 채움보다 정돈된 인상)
+      span.style.background = c + '1f';
+      span.style.color = c;
+      span.style.borderColor = c + '4d';
+      if (keys) {
+        var v = totals[k];
+        span.textContent = k + ' ' + (v >= 60 ? Math.floor(v / 60) + '시간 ' + (v % 60) + '분' : v + '분');
+      } else {
+        span.textContent = k;
+      }
+      box.appendChild(span);
+    });
+  }
+
+  // ---------- 줌 (FullCalendar 내부 스크롤 컨테이너 기준) ----------
+  function getScroller() {
+    return document.querySelector('.fc-scroller-liquid-absolute') ||
+           Array.prototype.slice.call(document.querySelectorAll('.fc-scroller')).pop();
+  }
+
+  function setSlotH(h, anchorClientY) {
+    h = clampH(h);
+    if (h === slotH) return;
+    var sc = getScroller();
+    if (!sc) {
+      slotH = h; root.style.setProperty('--slot-h', slotH + 'px'); calendar.updateSize();
+      return;
+    }
+    var rect = sc.getBoundingClientRect();
+    var off = (anchorClientY == null) ? rect.height / 2 : (anchorClientY - rect.top);
+    var contentY = sc.scrollTop + off;
+    var s = h / slotH;
+    slotH = h;
+    root.style.setProperty('--slot-h', slotH + 'px');
+    calendar.updateSize();
+    // updateSize()가 스크롤러 DOM을 재생성할 수 있으므로 반드시 재조회 후 보정
+    var sc2 = getScroller() || sc;
+    sc2.scrollTop = contentY * s - off;
+    localStorage.setItem('fc_slotH', slotH);
+  }
+
+  document.getElementById('zoomin').addEventListener('click', function () { setSlotH(slotH * 1.3, null); });
+  document.getElementById('zoomout').addEventListener('click', function () { setSlotH(slotH / 1.3, null); });
+  calEl.addEventListener('wheel', function (e) {
+    if (!e.ctrlKey) return;
+    e.preventDefault();
+    setSlotH(slotH * (e.deltaY < 0 ? 1.022 : 1 / 1.022), e.clientY);
+  }, { passive: false });
+
+  // ---------- 핀치 줌: 제스처 중 GPU transform만, 손 뗄 때 1회 커밋 ----------
+  var PINCH_DAMP = 0.5;
+  var pinch = null, pinchSeq = false, lastPinchEnd = 0;
+  var rafId = null, pendingScale = null, lastScrollAt = 0;
+  document.addEventListener('scroll', function () { lastScrollAt = performance.now(); },
+    { capture: true, passive: true });
+
+  function touchDist(t) {
+    return Math.hypot(t[0].clientX - t[1].clientX, t[0].clientY - t[1].clientY);
+  }
+
+  function commitPinch() {
+    if (!pinch) return;
+    var s = pendingScale || 1;
+    pinch.ct.style.transform = '';
+    pinch.ct.style.willChange = '';
+    root.classList.remove('pinching');
+    root.style.removeProperty('--isy');
+    var newH = clampH(pinch.startSlotH * s);
+    slotH = newH;
+    root.style.setProperty('--slot-h', slotH + 'px');
+    calendar.updateSize();
+    // updateSize()가 스크롤러 DOM을 재생성할 수 있음 — 옛 참조에 쓰면 보정이 무시되어
+    // 핀치 후 위치가 제멋대로 가거나(anchor 상실) 콘텐츠 밖 빈 영역이 보이는 원인
+    var sc2 = getScroller() || pinch.sc;
+    sc2.scrollTop = pinch.contentY * (slotH / pinch.startSlotH) - pinch.off;
+    localStorage.setItem('fc_slotH', slotH);
+    pinch = null;
+    pendingScale = null;
+    if (rafId) { cancelAnimationFrame(rafId); rafId = null; }
+  }
+
+  function initPinch(e) {
+    if (pinch) commitPinch();
+    var d = touchDist(e.touches);
+    if (d < 10) return;
+    var sc = getScroller();
+    if (!sc || !sc.firstElementChild) return;
+    var ct = sc.firstElementChild;
+    var rect = sc.getBoundingClientRect();
+    var midY = (e.touches[0].clientY + e.touches[1].clientY) / 2;
+    ct.style.transformOrigin = '0 0';
+    ct.style.willChange = 'transform';
+    root.classList.add('pinching');
+    pinch = {
+      sc: sc, ct: ct,
+      startDist: d,
+      startSlotH: slotH,
+      off: midY - rect.top,
+      contentY: sc.scrollTop + (midY - rect.top)
+    };
+    pendingScale = 1;
+    pinchSeq = true;
+  }
+
+  calEl.addEventListener('touchstart', function (e) {
+    if (e.touches.length !== 2) return;
+    // 직전 관성 스크롤 강제 정지 (제스처 소유권을 브라우저에 뺏기지 않도록)
+    if (performance.now() - lastScrollAt < 100) {
+      var sc = getScroller();
+      if (sc) {
+        var y = sc.scrollTop;
+        sc.style.overflow = 'hidden';
+        void sc.offsetHeight;
+        sc.style.overflow = '';
+        sc.scrollTop = y;
+      }
+    }
+    if (!e.cancelable) return;
+    e.preventDefault();
+    initPinch(e);
+  }, { passive: false });
+
+  calEl.addEventListener('touchmove', function (e) {
+    if (pinchSeq && e.cancelable && (e.touches.length !== 2 || !pinch)) {
+      e.preventDefault();  // 핀치 후 잔여 한 손가락 이동 삼킴
+      return;
+    }
+    if (e.touches.length !== 2) return;
+    if (!e.cancelable) { if (pinch) commitPinch(); return; }
+    if (!pinch) { initPinch(e); if (!pinch) return; }
+    e.preventDefault();
+    var ratio = 1 + (touchDist(e.touches) / pinch.startDist - 1) * PINCH_DAMP;
+    var target = clampH(pinch.startSlotH * ratio);
+    pendingScale = target / pinch.startSlotH;
+    if (!rafId) {
+      rafId = requestAnimationFrame(function () {
+        rafId = null;
+        if (!pinch || pendingScale === null) return;
+        var ty = pinch.contentY * (1 - pendingScale);
+        pinch.ct.style.transform = 'translateY(' + ty + 'px) scaleY(' + pendingScale + ')';
+        root.style.setProperty('--isy', 1 / pendingScale);
+      });
+    }
+  }, { passive: false });
+
+  ['touchend', 'touchcancel'].forEach(function (t) {
+    calEl.addEventListener(t, function (e) {
+      if (pinch) {
+        if (e.touches.length === 2) { initPinch(e); return; }
+        commitPinch();
+        lastPinchEnd = Date.now();
+      }
+      if (e.touches.length === 0) pinchSeq = false;
+    });
+  });
+
+  // ---------- 종료 시각 편집 바 ----------
+  var editbar = document.getElementById('editbar');
+  var selected = null;
+  document.addEventListener('click', function (e) {
+    if (e.target.closest && (e.target.closest('#editbar') || e.target.closest('.fc-event'))) return;
+    selected = null;
+    editbar.hidden = true;
+  });
+
+  function postEnd(val) {
+    if (!selected) return;
+    fetch('/events/' + selected.id + '/end', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'X-Requested-With': 'timeline' },
+      body: JSON.stringify({ end: val })
+    }).then(function (r) {
+      if (r.ok) {
+        editbar.hidden = true;
+        selected = null;
+        calendar.refetchEvents();
+      } else {
+        r.json().then(function (j) { alert(j.error || '저장 실패'); })
+          .catch(function () { alert('저장 실패 (' + r.status + ')'); });
+      }
+    }).catch(function () { alert('네트워크 오류'); });
+  }
+  document.getElementById('endsave').addEventListener('click', function () {
+    var v = document.getElementById('endtime').value;
+    if (v) postEnd(v);
+  });
+  document.getElementById('endclear').addEventListener('click', function () { postEnd(null); });
+})();
+</script>
+</body>
+</html>

@@ -1,0 +1,1224 @@
+import hashlib
+import html as html_lib
+import json
+import logging
+import os
+import sqlite3
+from datetime import datetime, timedelta
+from logging.handlers import RotatingFileHandler
+from pathlib import Path
+from typing import Optional
+from zoneinfo import ZoneInfo
+
+from fastapi import FastAPI, Header, Query
+from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi.staticfiles import StaticFiles
+from pydantic import BaseModel
+
+from app.constants import CATEGORIES, CATEGORY_COLORS, UNCATEGORIZED, UNCATEGORIZED_COLOR
+
+ROOT = Path(__file__).resolve().parent.parent
+DB_PATH = ROOT / "data" / "activity.db"
+LOG_PATH = ROOT / "logs" / "server.log"
+KST = ZoneInfo("Asia/Seoul")
+END_MARKERS = {"끝", "종료", "end"}
+
+DAY_START_HOUR = 0
+DAY_END_HOUR = 24
+TOTAL_MIN = (DAY_END_HOUR - DAY_START_HOUR) * 60
+WEEKDAYS = ["월", "화", "수", "목", "금", "토", "일"]
+
+PALETTE = list(CATEGORY_COLORS.values())
+
+
+def _load_env() -> None:
+    env_file = ROOT / ".env"
+    if not env_file.exists():
+        return
+    for line in env_file.read_text(encoding="utf-8").splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        os.environ.setdefault(key.strip(), value.strip())
+
+
+_load_env()
+ACTIVITY_TOKEN = os.environ.get("ACTIVITY_TOKEN", "")
+
+LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
+logger = logging.getLogger("activity_log")
+logger.setLevel(logging.INFO)
+_handler = RotatingFileHandler(LOG_PATH, maxBytes=1_000_000, backupCount=3, encoding="utf-8")
+_handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
+logger.addHandler(_handler)
+
+app = FastAPI(title="activity_log")
+app.mount("/static", StaticFiles(directory=ROOT / "app" / "static"), name="static")
+
+
+def get_db() -> sqlite3.Connection:
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+
+def init_db() -> None:
+    DB_PATH.parent.mkdir(parents=True, exist_ok=True)
+    with get_db() as conn:
+        conn.executescript(
+            """
+            CREATE TABLE IF NOT EXISTS events (
+              id INTEGER PRIMARY KEY AUTOINCREMENT,
+              ts TEXT NOT NULL,
+              received_at TEXT NOT NULL,
+              raw_text TEXT NOT NULL,
+              source TEXT NOT NULL,
+              category TEXT,
+              tags TEXT,
+              effective_ts TEXT,
+              note TEXT
+            );
+            CREATE INDEX IF NOT EXISTS idx_events_ts ON events(ts);
+            """
+        )
+    with get_db() as conn:
+        cols = [r[1] for r in conn.execute("PRAGMA table_info(events)")]
+        if "end_ts" not in cols:
+            conn.execute("ALTER TABLE events ADD COLUMN end_ts TEXT")
+        if "hidden" not in cols:
+            conn.execute("ALTER TABLE events ADD COLUMN hidden INTEGER NOT NULL DEFAULT 0")
+        if "display_text" not in cols:
+            conn.execute("ALTER TABLE events ADD COLUMN display_text TEXT")
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_events_eff ON events(COALESCE(effective_ts, ts))"
+        )
+
+
+init_db()
+
+
+def now_kst() -> datetime:
+    return datetime.now(KST)
+
+
+class LogIn(BaseModel):
+    text: str = ""
+    ts: Optional[str] = None
+    source: str = "voice"
+
+
+@app.get("/health")
+def health():
+    return {"ok": True}
+
+
+@app.post("/log")
+def post_log(body: LogIn, x_token: str = Header(default="")):
+    if not ACTIVITY_TOKEN or x_token != ACTIVITY_TOKEN:
+        return JSONResponse({"ok": False, "error": "unauthorized"}, status_code=401)
+    text = body.text.strip()
+    if not text:
+        return JSONResponse({"ok": False, "error": "text is empty"}, status_code=400)
+    # ts는 ISO8601만 신뢰. 파싱 불가한 형식(예: "2026. 8. 17. 오전 11:11")이면 서버 시각 사용
+    parsed = parse_ts(body.ts) if body.ts else None
+    ts = (parsed or now_kst()).isoformat(timespec="seconds")
+    received_at = now_kst().isoformat(timespec="seconds")
+    with get_db() as conn:
+        cur = conn.execute(
+            "INSERT INTO events (ts, received_at, raw_text, source) VALUES (?, ?, ?, ?)",
+            (ts, received_at, text, body.source or "voice"),
+        )
+    logger.info("log id=%s source=%s text=%s", cur.lastrowid, body.source, text)
+    return {"ok": True, "id": cur.lastrowid, "ts": ts}
+
+
+def _ui_forbidden(x_requested_with: str) -> Optional[JSONResponse]:
+    # CSRF 차단: 커스텀 헤더는 cross-origin에서 preflight 없이 보낼 수 없음 (CORS 미들웨어 없음)
+    if x_requested_with != "timeline":
+        return JSONResponse({"ok": False, "error": "forbidden"}, status_code=403)
+    return None
+
+
+def _get_event_or_404(conn: sqlite3.Connection, event_id: int):
+    row = conn.execute("SELECT * FROM events WHERE id = ?", (event_id,)).fetchone()
+    if row is None:
+        return None, JSONResponse({"ok": False, "error": "not found"}, status_code=404)
+    return row, None
+
+
+class EndIn(BaseModel):
+    end: Optional[str] = None  # "HH:MM" 또는 ISO8601, null이면 종료 시각 해제
+
+
+@app.post("/events/{event_id}/end")
+def set_event_end(event_id: int, body: EndIn, x_requested_with: str = Header(default="")):
+    if err := _ui_forbidden(x_requested_with):
+        return err
+    with get_db() as conn:
+        row, err = _get_event_or_404(conn, event_id)
+        if err:
+            return err
+        if body.end is None:
+            conn.execute("UPDATE events SET end_ts = NULL WHERE id = ?", (event_id,))
+            logger.info("end cleared id=%s", event_id)
+            return {"ok": True, "end_ts": None}
+        start = parse_ts(row["effective_ts"] or row["ts"])
+        if start is None:
+            return JSONResponse({"ok": False, "error": "이벤트 시각을 해석할 수 없음"}, status_code=400)
+        value = body.end.strip()
+        if len(value) == 5 and value[2] == ":":  # HH:MM → 이벤트 날짜와 결합, 시작보다 이르면 익일로 해석
+            try:
+                hh, mm = int(value[:2]), int(value[3:5])
+            except ValueError:
+                return JSONResponse({"ok": False, "error": "잘못된 시각 형식"}, status_code=400)
+            start_min = start.replace(second=0, microsecond=0)
+            end_dt = start.replace(hour=hh, minute=mm, second=0, microsecond=0)
+            if end_dt == start_min:
+                return JSONResponse({"ok": False, "error": "종료가 시작 시각과 같아요"}, status_code=400)
+            if end_dt < start_min:
+                end_dt += timedelta(days=1)  # 자정 넘김 (예: 23:00 시작 → 07:00 종료)
+        else:
+            end_dt = parse_ts(value)
+        if end_dt is None:
+            return JSONResponse({"ok": False, "error": "잘못된 시각 형식"}, status_code=400)
+        if end_dt <= start:
+            return JSONResponse({"ok": False, "error": "종료 시각이 시작 시각보다 빨라요"}, status_code=400)
+        if end_dt - start > timedelta(hours=18):
+            return JSONResponse({"ok": False, "error": "18시간을 넘는 활동은 저장할 수 없어요"}, status_code=400)
+        end_iso = end_dt.isoformat(timespec="seconds")
+        conn.execute("UPDATE events SET end_ts = ? WHERE id = ?", (end_iso, event_id))
+    logger.info("end set id=%s end_ts=%s", event_id, end_iso)
+    return {"ok": True, "end_ts": end_iso}
+
+
+class CategoryIn(BaseModel):
+    category: Optional[str] = None  # null이면 카테고리 리셋 → 다음 배치가 재분류 (effective_ts 유지)
+
+
+@app.post("/events/{event_id}/category")
+def set_event_category(event_id: int, body: CategoryIn, x_requested_with: str = Header(default="")):
+    if err := _ui_forbidden(x_requested_with):
+        return err
+    if body.category is not None and body.category not in CATEGORIES:
+        return JSONResponse({"ok": False, "error": "알 수 없는 카테고리"}, status_code=400)
+    with get_db() as conn:
+        _, err = _get_event_or_404(conn, event_id)
+        if err:
+            return err
+        if body.category is None:
+            conn.execute("UPDATE events SET category = NULL, tags = NULL WHERE id = ?", (event_id,))
+        else:
+            conn.execute("UPDATE events SET category = ? WHERE id = ?", (body.category, event_id))
+    logger.info("category id=%s -> %s", event_id, body.category)
+    return {"ok": True, "category": body.category}
+
+
+class TextIn(BaseModel):
+    text: Optional[str] = None  # null/빈 문자열이면 원문(raw_text)으로 복원
+
+
+@app.post("/events/{event_id}/edit")
+def set_event_text(event_id: int, body: TextIn, x_requested_with: str = Header(default="")):
+    if err := _ui_forbidden(x_requested_with):
+        return err
+    with get_db() as conn:
+        row, err = _get_event_or_404(conn, event_id)
+        if err:
+            return err
+        new_text = (body.text or "").strip() or None
+        if new_text == row["raw_text"]:
+            new_text = None  # 원문과 같으면 저장하지 않음
+        # 텍스트가 바뀌면 카테고리를 리셋해 다음 배치가 교정된 텍스트로 재분류 (effective_ts 유지)
+        conn.execute(
+            "UPDATE events SET display_text = ?, category = NULL, tags = NULL WHERE id = ?",
+            (new_text, event_id),
+        )
+    logger.info("edit id=%s display_text=%s", event_id, new_text)
+    return {"ok": True, "display_text": new_text}
+
+
+class HideIn(BaseModel):
+    hidden: bool
+
+
+@app.post("/events/{event_id}/hide")
+def set_event_hidden(event_id: int, body: HideIn, x_requested_with: str = Header(default="")):
+    if err := _ui_forbidden(x_requested_with):
+        return err
+    with get_db() as conn:
+        _, err = _get_event_or_404(conn, event_id)
+        if err:
+            return err
+        conn.execute("UPDATE events SET hidden = ? WHERE id = ?", (1 if body.hidden else 0, event_id))
+    logger.info("hide id=%s hidden=%s", event_id, body.hidden)
+    return {"ok": True, "hidden": body.hidden}
+
+
+def fetch_events(date: str) -> list[sqlite3.Row]:
+    # 회상 입력은 effective_ts로 재배치되므로 조회/정렬 모두 COALESCE 기준.
+    # hidden 이벤트도 포함한다 — 시간 경계는 유지하고 렌더/집계에서만 제외 (숨김이 이전 블록을 늘리지 않게).
+    with get_db() as conn:
+        return conn.execute(
+            "SELECT * FROM events WHERE substr(COALESCE(effective_ts, ts), 1, 10) = ? "
+            "ORDER BY COALESCE(effective_ts, ts) ASC, id ASC",
+            (date,),
+        ).fetchall()
+
+
+@app.get("/events")
+def get_events(
+    date: Optional[str] = Query(default=None),
+    include_hidden: bool = Query(default=False),
+):
+    date = date or now_kst().strftime("%Y-%m-%d")
+    rows = fetch_events(date)
+    out = []
+    for r in rows:
+        if r["hidden"] and not include_hidden:
+            continue
+        d = dict(r)
+        d["text"] = r["display_text"] or r["raw_text"]
+        out.append(d)
+    return {"date": date, "events": out}
+
+
+def parse_ts(value: str) -> Optional[datetime]:
+    try:
+        dt = datetime.fromisoformat(value)
+    except (ValueError, TypeError):
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=KST)
+    return dt.astimezone(KST)
+
+
+def _compute_end(start: datetime, row: sqlite3.Row, nxt: Optional[datetime], now: datetime):
+    """이벤트의 (클리핑 전) 종료 시각 계산. 반환: (end, has_explicit, explicit_dt, natural_end)
+
+    규칙 (플랜 리뷰 반영):
+    - 전역 다음 이벤트가 start+24h 이내면 그 시작까지 (자정 넘김 허용)
+    - 전역 다음이 없으면 min(now, start+24h) — 날짜와 무관하게 '진행 중' 연장
+    - 전역 다음이 24h 초과 뒤면 원본일 24:00 (오늘이면 now까지) — 유령 이월 방지
+    - 명시적 end_ts는 위 상한 안에서 우선
+    """
+    limit = start + timedelta(hours=24)
+    own_day_end = start.replace(hour=0, minute=0, second=0, microsecond=0) + timedelta(days=1)
+    if nxt is not None and nxt <= limit:
+        natural = max(nxt, start)
+        cap = natural
+    elif nxt is None:
+        natural = max(start, min(now, limit))
+        cap = limit
+    else:
+        natural = max(start, min(now, own_day_end)) if now < own_day_end else own_day_end
+        cap = own_day_end
+    explicit = parse_ts(row["end_ts"]) if row["end_ts"] else None
+    is_empty = row["raw_text"].strip().lower() in END_MARKERS  # 마커 판정은 raw_text 고정
+    has_explicit = explicit is not None and not is_empty
+    end = min(max(explicit, start), cap) if has_explicit else natural
+    return end, has_explicit, explicit, natural
+
+
+def _make_block(row: sqlite3.Row, start: datetime, end: datetime, *, has_explicit: bool,
+                explicit: Optional[datetime], ongoing: bool, carry: bool) -> dict:
+    is_empty = row["raw_text"].strip().lower() in END_MARKERS
+    return {
+        "id": row["id"],
+        "start": start,
+        "end": end,
+        "orig_start": parse_ts(row["effective_ts"] or row["ts"]),
+        "text": row["display_text"] or row["raw_text"],
+        "category": row["category"],
+        "empty": is_empty,
+        "hidden": bool(row["hidden"]),
+        "explicit_end": has_explicit,
+        "explicit_hhmm": explicit.strftime("%H:%M") if has_explicit and explicit else "",
+        "ongoing": ongoing,
+        "carry": carry,
+    }
+
+
+def build_blocks(date: str) -> list[dict]:
+    """날짜 D의 타임블록. 자정 넘김 이월 포함, 모든 블록은 [D 00:00, D+1 00:00)로 클리핑됨."""
+    day0 = datetime.strptime(date, "%Y-%m-%d").replace(tzinfo=KST)
+    day1 = day0 + timedelta(days=1)
+    now = now_kst()
+    rows = fetch_events(date)
+
+    events = []
+    for row in rows:
+        dt = parse_ts(row["effective_ts"] or row["ts"])
+        if dt is not None:
+            events.append((dt, row))
+    events.sort(key=lambda e: e[0])
+
+    with get_db() as conn:
+        last_coal = events[-1][0].isoformat() if events else day0.isoformat()
+        nrow = conn.execute(
+            "SELECT COALESCE(effective_ts, ts) AS c FROM events "
+            "WHERE COALESCE(effective_ts, ts) > ? ORDER BY COALESCE(effective_ts, ts) LIMIT 1",
+            (last_coal,),
+        ).fetchone()
+        global_next = parse_ts(nrow["c"]) if nrow else None
+        prow = conn.execute(
+            "SELECT * FROM events WHERE COALESCE(effective_ts, ts) < ? "
+            "ORDER BY COALESCE(effective_ts, ts) DESC LIMIT 1",
+            (day0.isoformat(),),
+        ).fetchone()
+
+    blocks: list[dict] = []
+
+    # 이월(carry-over): 전날 마지막 이벤트가 D 00:00을 strict 하게 넘는 경우 (마커 블록은 제외)
+    if prow is not None:
+        pstart = parse_ts(prow["effective_ts"] or prow["ts"])
+        p_is_empty = prow["raw_text"].strip().lower() in END_MARKERS
+        if pstart is not None and not p_is_empty:
+            p_next = events[0][0] if events else global_next
+            pend, p_has_exp, p_exp, _ = _compute_end(pstart, prow, p_next, now)
+            if pend > day0:
+                p_ongoing = (
+                    not events and global_next is None and not p_has_exp
+                    and now < pstart + timedelta(hours=24)
+                )
+                blk = _make_block(prow, day0, min(pend, day1), has_explicit=p_has_exp,
+                                  explicit=p_exp, ongoing=p_ongoing, carry=True)
+                blocks.append(blk)
+
+    for i, (start, row) in enumerate(events):
+        nxt = events[i + 1][0] if i + 1 < len(events) else global_next
+        end, has_explicit, explicit, natural = _compute_end(start, row, nxt, now)
+        ongoing = (
+            nxt is None and not has_explicit
+            and row["raw_text"].strip().lower() not in END_MARKERS
+            and start < now < start + timedelta(hours=24)
+        )
+        blocks.append(_make_block(row, start, min(end, day1), has_explicit=has_explicit,
+                                  explicit=explicit, ongoing=ongoing, carry=False))
+        # 명시적 종료와 다음 활동 사이의 공백은 빈 시간으로 표시 (당일 범위 안에서만)
+        gap_end = min(natural, day1)
+        if has_explicit and (gap_end - min(end, day1)).total_seconds() > 30:
+            blocks.append(
+                {
+                    "id": None, "start": min(end, day1), "end": gap_end, "orig_start": None,
+                    "text": "", "category": None, "empty": True, "hidden": False,
+                    "explicit_end": False, "explicit_hhmm": "", "ongoing": False, "carry": False,
+                }
+            )
+    return blocks
+
+
+def _visible_minutes(b: dict) -> int:
+    return int((b["end"] - b["start"]).total_seconds() // 60)
+
+
+def category_color(category: Optional[str]) -> str:
+    if not category:
+        return UNCATEGORIZED_COLOR
+    if category in CATEGORY_COLORS:
+        return CATEGORY_COLORS[category]
+    # 목록 밖 카테고리는 md5 기반 고정 색 (hash()는 프로세스마다 달라짐)
+    digest = hashlib.md5(category.encode()).digest()
+    return PALETTE[digest[0] % len(PALETTE)]
+
+
+def _text_on(color: str) -> str:
+    """배경색 명도에 따라 흰/검 텍스트 선택 (텍스트 가독성)."""
+    r, g, b = (int(color[i:i + 2], 16) / 255 for i in (1, 3, 5))
+    lin = [c / 12.92 if c <= 0.03928 else ((c + 0.055) / 1.055) ** 2.4 for c in (r, g, b)]
+    lum = 0.2126 * lin[0] + 0.7152 * lin[1] + 0.0722 * lin[2]
+    return "#ffffff" if lum < 0.45 else "#1f2328"
+
+
+def assign_columns(blocks: list[dict]) -> list[tuple[int, int]]:
+    """시간이 겹치는 블록을 나란히 배치하기 위한 (컬럼, 총컬럼수) 할당 — 구글 캘린더 방식."""
+    layouts: list = [None] * len(blocks)
+    order = sorted(range(len(blocks)), key=lambda i: blocks[i]["start"])
+    cluster: list[tuple[int, int]] = []
+    col_ends: list = []
+
+    def close_cluster():
+        ncols = len(col_ends)
+        for idx, col in cluster:
+            layouts[idx] = (col, ncols)
+
+    for i in order:
+        start = blocks[i]["start"]
+        eff_end = max(blocks[i]["end"], start + timedelta(minutes=1))
+        if col_ends and all(e <= start for e in col_ends):
+            close_cluster()
+            cluster, col_ends = [], []
+        placed = False
+        for c in range(len(col_ends)):
+            if col_ends[c] <= start:
+                col_ends[c] = eff_end
+                cluster.append((i, c))
+                placed = True
+                break
+        if not placed:
+            col_ends.append(eff_end)
+            cluster.append((i, len(col_ends) - 1))
+    close_cluster()
+    return layouts
+
+
+def render_day_column(date: str, blocks: list[dict], show_hidden: bool) -> str:
+    axis_start = datetime.strptime(date, "%Y-%m-%d").replace(hour=DAY_START_HOUR, tzinfo=KST)
+    layouts = assign_columns(blocks)
+    parts = []
+    for bi, b in enumerate(blocks):
+        start_min = (b["start"] - axis_start).total_seconds() / 60
+        end_min = (b["end"] - axis_start).total_seconds() / 60
+        start_min = max(0.0, min(start_min, TOTAL_MIN))
+        end_min = max(0.0, min(end_min, TOTAL_MIN))
+        dur = end_min - start_min
+        if end_min <= 0 or dur < 0:
+            continue
+        hidden_as_empty = b["hidden"] and not show_hidden
+        if b["empty"] or hidden_as_empty:
+            cls = "block empty"
+            style = ""
+            label = f'{b["start"].strftime("%H:%M")} 빈 시간'
+            data_attrs = ""
+        else:
+            color = category_color(b["category"])
+            cls = "block " + ("fixedend" if b["explicit_end"] else "auto")
+            if b["hidden"]:
+                cls += " hiddenblk"
+            style = f"background:{color};color:{_text_on(color)};"
+            start_label = (b["orig_start"] or b["start"]).strftime("%H:%M")
+            prefix = "↪ " if b["carry"] else ""
+            end_str = f'-{b["explicit_hhmm"]}' if b["explicit_end"] else ""
+            suffix = " · 진행 중" if b["ongoing"] else ""
+            label = f'{prefix}{start_label}{end_str} {html_lib.escape(b["text"])}{suffix}'
+            data_attrs = (
+                f' data-id="{b["id"]}"'
+                f' data-end="{b["explicit_hhmm"]}"'
+                f' data-category="{html_lib.escape(b["category"] or "", quote=True)}"'
+                f' data-text="{html_lib.escape(b["text"], quote=True)}"'
+                f' data-start="{start_label}"'
+                f' data-hidden="{1 if b["hidden"] else 0}"'
+            )
+        col, ncols = layouts[bi]
+        if ncols > 1:
+            w = 100.0 / ncols
+            style += f"left:calc({col * w:.2f}% + 2px);width:calc({w:.2f}% - 4px);right:auto;"
+        parts.append(
+            f'<div class="{cls}"{data_attrs} style="top:calc({start_min:.1f} * var(--ppm));'
+            f'height:calc({max(dur, 1):.1f} * var(--ppm));'
+            f'min-height:calc({max(dur, 1):.1f} * var(--ppm));{style}" title="{label}">'
+            f'<span class="bt">{label}</span></div>'
+        )
+    return f'<div class="day"><div class="canvas" data-date="{date}">{"".join(parts)}</div></div>'
+
+
+def _chip(name: str, minutes: Optional[int]) -> str:
+    color = UNCATEGORIZED_COLOR if name in (UNCATEGORIZED, "기록 없음") else category_color(name)
+    if minutes is None:
+        body = html_lib.escape(name)
+    else:
+        t = f"{minutes // 60}시간 {minutes % 60}분" if minutes >= 60 else f"{minutes}분"
+        body = f"{html_lib.escape(name)} {t}"
+    return (
+        f'<span class="chip" style="background:{color}1f;color:{color};'
+        f'border-color:{color}55">{body}</span>'
+    )
+
+
+def render_timeline(start_date: str, days: int, show_hidden: bool) -> str:
+    start = datetime.strptime(start_date, "%Y-%m-%d")
+    dates = [(start + timedelta(days=i)).strftime("%Y-%m-%d") for i in range(days)]
+    prev_date = (start - timedelta(days=days)).strftime("%Y-%m-%d")
+    next_date = (start + timedelta(days=days)).strftime("%Y-%m-%d")
+    today = now_kst().strftime("%Y-%m-%d")
+    hq = "&hidden=1" if show_hidden else ""
+
+    per_day = {d: build_blocks(d) for d in dates}
+
+    totals: dict[str, int] = {}
+    for blocks in per_day.values():
+        for b in blocks:
+            if b["empty"] or b["hidden"]:
+                continue
+            key = b["category"] or UNCATEGORIZED
+            totals[key] = totals.get(key, 0) + _visible_minutes(b)
+    totals_html = "".join(
+        _chip(k, v) for k, v in sorted(totals.items(), key=lambda kv: -kv[1])
+    ) or _chip("기록 없음", None)
+
+    dayheads_html = "".join(
+        f'<a class="dayhead{" today" if d == today else ""}" href="/timeline?date={d}&days=1{hq}">'
+        f'{int(d[5:7])}/{int(d[8:10])} ({WEEKDAYS[datetime.strptime(d, "%Y-%m-%d").weekday()]})</a>'
+        for d in dates
+    )
+    columns_html = "".join(render_day_column(d, per_day[d], show_hidden) for d in dates)
+    hours_html = "".join(
+        f'<div class="hour" style="top:calc({(h - DAY_START_HOUR) * 60} * var(--ppm))"><span class="bt">{h:02d}</span></div>'
+        for h in range(DAY_START_HOUR, DAY_END_HOUR + 1)
+    )
+    days_options = "".join(
+        f'<option value="{n}"{" selected" if n == days else ""}>{n}일</option>' for n in range(1, 8)
+    )
+    cat_options = "".join(f'<option value="{c}">{c}</option>' for c in CATEGORIES)
+    hidden_toggle = (
+        f'<a class="hlink" href="/timeline?date={start_date}&days={days}">숨김 닫기</a>'
+        if show_hidden else
+        f'<a class="hlink" href="/timeline?date={start_date}&days={days}&hidden=1">숨김 보기</a>'
+    )
+
+    return f"""<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>{start_date} 타임라인</title>
+<link rel="manifest" href="/static/manifest.webmanifest">
+<link rel="apple-touch-icon" href="/static/icon-180.png">
+<meta name="theme-color" content="#2563eb">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="default">
+<meta name="apple-mobile-web-app-title" content="활동 로그">
+<style>
+  :root {{ --ppm: 1.6px; --accent: #2563eb; --text: #1f2328; --muted: #6b7280; --line: #eceef1; }}
+  * {{ box-sizing: border-box; }}
+  /* 줌으로 문서 높이가 바뀔 때 브라우저의 자동 스크롤 보정(scroll anchoring)이
+     우리의 수동 보정과 충돌해 화면이 튀므로 비활성화. 당겨서 새로고침도 차단 */
+  html {{ overflow-anchor: none; overscroll-behavior-y: contain; }}
+  body {{ font-family: "Pretendard Variable", Pretendard, -apple-system, BlinkMacSystemFont,
+                       "Apple SD Gothic Neo", "Noto Sans KR", "Segoe UI", "Malgun Gothic", sans-serif;
+          margin: 0; background: #fff; color: var(--text);
+          -webkit-font-smoothing: antialiased; letter-spacing: -0.01em;
+          touch-action: pan-y; }}
+  .topbar {{ position: sticky; top: 0; z-index: 20; background: #fff; border-bottom: 1px solid var(--line);
+             padding: 8px 8px 0; }}
+  .controls {{ display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }}
+  .controls .nav {{ text-decoration: none; color: var(--muted); font-size: 18px; padding: 6px 10px; }}
+  .controls input[type=date], .controls select, .controls .todaybtn, .zoom button {{
+    height: 34px; font-size: 14px; border: 1px solid var(--line); border-radius: 9px;
+    background: #fff; color: var(--text); padding: 0 9px; }}
+  .controls input[type=date] {{ font-variant-numeric: tabular-nums; }}
+  .controls .todaybtn {{ text-decoration: none; color: var(--accent); font-weight: 600;
+                         cursor: pointer; display: inline-flex; align-items: center; }}
+  .controls .hlink {{ font-size: 12px; color: var(--muted); text-decoration: none; padding: 4px; }}
+  .zoom {{ margin-left: auto; display: flex; gap: 4px; }}
+  .zoom button {{ width: 34px; padding: 0; font-size: 18px; color: var(--muted); cursor: pointer; }}
+  .totals {{ padding: 7px 0; display: flex; flex-wrap: wrap; gap: 5px; }}
+  .chip {{ border-radius: 999px; padding: 3px 10px; font-size: 12.5px; font-weight: 600;
+           white-space: nowrap; border: 1px solid transparent; }}
+  .dayheads {{ display: flex; margin-left: 44px; }}
+  .dayhead {{ flex: 1; min-width: 0; text-align: center; font-size: 13px; padding: 5px 0;
+              text-decoration: none; color: var(--text); font-weight: 600;
+              border-left: 1px solid var(--line); }}
+  .dayhead.today {{ color: var(--accent); }}
+  .layout {{ display: flex; touch-action: pan-y; }}
+  .axis {{ width: 44px; flex: none; position: relative; height: calc({TOTAL_MIN} * var(--ppm)); }}
+  .hour {{ position: absolute; right: 6px; transform: translateY(-50%); font-size: 11px;
+           color: var(--muted); font-variant-numeric: tabular-nums; }}
+  .daycols {{ display: flex; flex: 1; min-width: 0; }}
+  .day {{ flex: 1; min-width: 0; border-left: 1px solid var(--line); }}
+  .canvas {{ position: relative; height: calc({TOTAL_MIN} * var(--ppm));
+             background-image: linear-gradient(to bottom, #f1f3f4 1px, transparent 1px);
+             background-size: 100% calc(60 * var(--ppm));
+             contain: layout paint; }}
+  .block {{ position: absolute; left: 2px; right: 2px; border-radius: 6px; padding: 1px 6px;
+            font-size: 12px; line-height: 1.35; font-weight: 500; overflow: hidden; z-index: 1; }}
+  .block.empty {{ background: repeating-linear-gradient(45deg, #f6f7f8, #f6f7f8 8px, #eceef1 8px, #eceef1 16px);
+                  color: #9aa1a9; }}
+  .block.hiddenblk {{ opacity: .45; }}
+  .block.focus {{ height: auto !important; min-height: 20px; z-index: 5;
+                  left: 2px !important; right: 2px !important; width: auto !important;
+                  outline: 2px solid var(--accent); box-shadow: 0 2px 10px rgba(0,0,0,.35); }}
+  .block.focus .bt {{ white-space: normal; }}
+  @media (hover: hover) and (pointer: fine) {{
+    .block:hover {{ height: auto !important; min-height: 20px; z-index: 5;
+                    left: 2px !important; right: 2px !important; width: auto !important;
+                    outline: 2px solid var(--accent); box-shadow: 0 2px 10px rgba(0,0,0,.35); }}
+    .block:hover .bt {{ white-space: normal; }}
+  }}
+  .block.fixedend {{ border-bottom: 3px solid rgba(0,0,0,.3); }}
+  .block.auto {{ border-bottom: 1px dashed rgba(0,0,0,.55); }}
+  .bt {{ display: block; transform-origin: 0 0;
+         white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }}
+  html.pinching .bt {{ transform: scaleY(var(--isy, 1)); }}
+  .nowline {{ position: absolute; left: 0; right: 0; height: 0; border-top: 2px solid #ef4444; z-index: 2; }}
+  .nowline::before {{ content: ""; position: absolute; left: -4px; top: -5px; width: 8px; height: 8px;
+                      border-radius: 50%; background: #ef4444; }}
+  #editbar {{ position: fixed; left: 0; right: 0; bottom: 0; z-index: 30; background: #fff;
+              border-top: 1px solid var(--line); box-shadow: 0 -4px 16px rgba(0,0,0,.07);
+              display: flex; flex-direction: column; gap: 7px; padding: 10px 12px;
+              padding-bottom: calc(10px + env(safe-area-inset-bottom)); }}
+  #editbar[hidden] {{ display: none; }}
+  .ebrow {{ display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }}
+  #editstart {{ font-size: 12px; color: var(--muted); white-space: nowrap;
+                font-variant-numeric: tabular-nums; }}
+  #edittext {{ flex: 1; min-width: 0; font-size: 14px; padding: 7px 9px;
+               border: 1px solid var(--line); border-radius: 9px; }}
+  #editcat {{ flex: 1; min-width: 110px; height: 36px; font-size: 14px;
+              border: 1px solid var(--line); border-radius: 9px; background: #fff; }}
+  #endtime {{ font-size: 14px; padding: 4px 6px; border: 1px solid var(--line);
+              border-radius: 9px; min-width: 88px; min-height: 36px; background: #fff;
+              color: var(--text); -webkit-appearance: none; appearance: none;
+              font-variant-numeric: tabular-nums; }}
+  #editbar button {{ font-size: 13.5px; padding: 8px 10px; border: 1px solid var(--line);
+                     border-radius: 9px; background: #fff; white-space: nowrap;
+                     cursor: pointer; color: var(--text); font-weight: 500; }}
+  #editbar #endsave {{ background: var(--accent); color: #fff; border-color: var(--accent);
+                       font-weight: 600; }}
+  #hidebtn {{ color: #b23; }}
+</style>
+</head>
+<body>
+<div class="topbar">
+  <div class="controls">
+    <a class="nav" href="/timeline?date={prev_date}&days={days}{hq}">◀</a>
+    <input type="date" id="datepick" value="{start_date}">
+    <a class="nav" href="/timeline?date={next_date}&days={days}{hq}">▶</a>
+    <select id="dayspick">{days_options}</select>
+    <a class="todaybtn" href="/timeline?date={today}&days={days}{hq}">오늘</a>
+    <button class="todaybtn" id="gotonow">현재</button>
+    <a class="todaybtn" href="/stats">통계</a>
+    {hidden_toggle}
+    <div class="zoom">
+      <button id="zoomout" aria-label="축소">−</button>
+      <button id="zoomin" aria-label="확대">＋</button>
+    </div>
+  </div>
+  <div class="totals">{totals_html}</div>
+  <div class="dayheads">{dayheads_html}</div>
+</div>
+<div class="layout">
+  <div class="axis">{hours_html}</div>
+  <div class="daycols">{columns_html}</div>
+</div>
+<div id="editbar" hidden>
+  <div class="ebrow">
+    <span id="editstart"></span>
+    <input type="text" id="edittext" placeholder="텍스트 수정">
+  </div>
+  <div class="ebrow">
+    <select id="editcat">
+      <option value="">자동 재분류(다음 배치)</option>
+      {cat_options}
+    </select>
+    <input type="time" id="endtime">
+    <button id="endsave">저장</button>
+    <button id="hidebtn">숨김</button>
+    <button id="closebtn">✕</button>
+  </div>
+</div>
+<script>
+(function () {{
+  var DAYS = {days};
+  var HQ = '{hq}';
+  var root = document.documentElement;
+  var MIN = 0.4, MAX = 20;
+  var ppm = Math.min(MAX, Math.max(MIN, parseFloat(localStorage.getItem('ppm')) || 1.6));
+
+  function apply() {{ root.style.setProperty('--ppm', ppm + 'px'); }}
+  apply();
+
+  var layout = document.querySelector('.layout');
+
+  function zoomAt(factor, clientY) {{
+    var old = ppm;
+    ppm = Math.min(MAX, Math.max(MIN, ppm * factor));
+    if (ppm === old) return;
+    var rect = layout.getBoundingClientRect();
+    var y = clientY - rect.top;
+    var target = window.scrollY + y * (ppm / old) - y;
+    apply();
+    localStorage.setItem('ppm', ppm);
+    window.scrollTo(0, target);
+  }}
+
+  document.getElementById('zoomin').addEventListener('click', function () {{
+    zoomAt(1.3, window.innerHeight / 2);
+  }});
+  document.getElementById('zoomout').addEventListener('click', function () {{
+    zoomAt(1 / 1.3, window.innerHeight / 2);
+  }});
+
+  layout.addEventListener('wheel', function (e) {{
+    if (!e.ctrlKey) return;
+    e.preventDefault();
+    zoomAt(e.deltaY < 0 ? 1.022 : 1 / 1.022, e.clientY);
+  }}, {{ passive: false }});
+
+  // 모바일 핀치: 제스처 중 GPU transform(scaleY)만 갱신, 손 뗄 때 1회 커밋
+  var PINCH_DAMP = 0.5;
+  var pinch = null, lastPinchEnd = 0, pinchSeq = false;
+  var rafId = null, pendingScale = null;
+  var lastScrollAt = 0;
+  window.addEventListener('scroll', function () {{ lastScrollAt = performance.now(); }}, {{ passive: true }});
+
+  function touchDist(t) {{
+    return Math.hypot(t[0].clientX - t[1].clientX, t[0].clientY - t[1].clientY);
+  }}
+
+  function commitPinch() {{
+    if (!pinch) return;
+    var s = pendingScale || 1;
+    ppm = Math.min(MAX, Math.max(MIN, pinch.startPpm * s));
+    layout.style.transform = '';
+    layout.style.willChange = '';
+    root.classList.remove('pinching');
+    root.style.removeProperty('--isy');
+    apply();
+    window.scrollTo(0, Math.max(0, pinch.layoutTop + pinch.anchorPx * (ppm / pinch.startPpm) - pinch.anchorClientY));
+    localStorage.setItem('ppm', ppm);
+    pinch = null;
+    pendingScale = null;
+    if (rafId) {{ cancelAnimationFrame(rafId); rafId = null; }}
+  }}
+
+  function initPinch(e) {{
+    if (pinch) commitPinch();
+    var d = touchDist(e.touches);
+    if (d < 10) return;
+    var rect = layout.getBoundingClientRect();
+    var midY = (e.touches[0].clientY + e.touches[1].clientY) / 2;
+    layout.style.transformOrigin = '0 0';
+    layout.style.willChange = 'transform';
+    root.classList.add('pinching');
+    pinch = {{
+      startDist: d,
+      startPpm: ppm,
+      anchorPx: midY - rect.top,
+      anchorClientY: midY,
+      layoutTop: rect.top + window.scrollY
+    }};
+    pendingScale = 1;
+    pinchSeq = true;
+  }}
+
+  layout.addEventListener('touchstart', function (e) {{
+    if (e.touches.length !== 2) return;
+    if (performance.now() - lastScrollAt < 100) {{
+      var y = window.scrollY;
+      root.style.overflow = 'hidden';
+      void root.offsetHeight;
+      root.style.overflow = '';
+      window.scrollTo(0, y);
+    }}
+    if (!e.cancelable) return;
+    e.preventDefault();
+    initPinch(e);
+  }}, {{ passive: false }});
+
+  layout.addEventListener('touchmove', function (e) {{
+    if (pinchSeq && e.cancelable && (e.touches.length !== 2 || !pinch)) {{
+      e.preventDefault();
+      return;
+    }}
+    if (e.touches.length !== 2) return;
+    if (!e.cancelable) {{ if (pinch) commitPinch(); return; }}
+    if (!pinch) {{ initPinch(e); if (!pinch) return; }}
+    e.preventDefault();
+    var ratio = 1 + (touchDist(e.touches) / pinch.startDist - 1) * PINCH_DAMP;
+    var targetPpm = Math.min(MAX, Math.max(MIN, pinch.startPpm * ratio));
+    pendingScale = targetPpm / pinch.startPpm;
+    if (!rafId) {{
+      rafId = requestAnimationFrame(function () {{
+        rafId = null;
+        if (!pinch || pendingScale === null) return;
+        var ty = pinch.anchorPx * (1 - pendingScale);
+        layout.style.transform = 'translateY(' + ty + 'px) scaleY(' + pendingScale + ')';
+        root.style.setProperty('--isy', 1 / pendingScale);
+      }});
+    }}
+  }}, {{ passive: false }});
+
+  ['touchend', 'touchcancel'].forEach(function (t) {{
+    layout.addEventListener(t, function (e) {{
+      if (pinch) {{
+        if (e.touches.length === 2) {{ initPinch(e); return; }}
+        commitPinch();
+        lastPinchEnd = Date.now();
+      }}
+      if (e.touches.length === 0) pinchSeq = false;
+    }});
+  }});
+
+  // ---------- 편집 패널 ----------
+  var editbar = document.getElementById('editbar');
+  var selected = null;
+  var dirty = {{ text: false, cat: false, end: false }};
+  var edittext = document.getElementById('edittext');
+  var editcat = document.getElementById('editcat');
+  var endtime = document.getElementById('endtime');
+
+  edittext.addEventListener('input', function () {{ dirty.text = true; }});
+  editcat.addEventListener('change', function () {{ dirty.cat = true; }});
+  endtime.addEventListener('input', function () {{ dirty.end = true; }});
+  endtime.addEventListener('change', function () {{ dirty.end = true; }});
+
+  function openEdit(b) {{
+    selected = b;
+    dirty = {{ text: false, cat: false, end: false }};
+    document.getElementById('editstart').textContent = (b.dataset.start || '') + ' 시작';
+    edittext.value = b.dataset.text || '';
+    editcat.value = b.dataset.category || '';
+    endtime.value = b.dataset.end || '';
+    document.getElementById('hidebtn').textContent = b.dataset.hidden === '1' ? '숨김 해제' : '숨김';
+    editbar.hidden = false;
+    document.body.style.paddingBottom = '140px';
+  }}
+
+  function closeEdit() {{
+    selected = null;
+    editbar.hidden = true;
+    document.body.style.paddingBottom = '';
+    document.querySelectorAll('.block.focus').forEach(function (x) {{ x.classList.remove('focus'); }});
+  }}
+
+  document.addEventListener('click', function (e) {{
+    if (Date.now() - lastPinchEnd < 400) return;
+    if (e.target.closest && e.target.closest('#editbar')) return;
+    var b = e.target.closest ? e.target.closest('.block') : null;
+    document.querySelectorAll('.block.focus').forEach(function (x) {{
+      if (x !== b) x.classList.remove('focus');
+    }});
+    if (b) b.classList.toggle('focus');
+    if (b && b.classList.contains('focus') && b.dataset.id) {{
+      openEdit(b);
+    }} else {{
+      closeEdit();
+    }}
+  }});
+
+  function api(path, body) {{
+    return fetch(path, {{
+      method: 'POST',
+      headers: {{ 'Content-Type': 'application/json', 'X-Requested-With': 'timeline' }},
+      body: JSON.stringify(body)
+    }}).then(function (r) {{
+      if (r.ok) return;
+      return r.json().then(function (j) {{ throw new Error(j.error || ('저장 실패 ' + r.status)); }},
+                           function () {{ throw new Error('저장 실패 ' + r.status); }});
+    }});
+  }}
+
+  document.getElementById('endsave').addEventListener('click', function () {{
+    if (!selected) return;
+    var id = selected.dataset.id;
+    var seq = Promise.resolve();
+    if (dirty.text) {{
+      var t = edittext.value.trim();
+      seq = seq.then(function () {{ return api('/events/' + id + '/edit', {{ text: t || null }}); }});
+    }}
+    if (dirty.cat) {{
+      var c = editcat.value;
+      seq = seq.then(function () {{ return api('/events/' + id + '/category', {{ category: c || null }}); }});
+    }}
+    if (dirty.end) {{
+      var v = endtime.value;
+      if (v) {{
+        var st = selected.dataset.start || '';
+        if (st && v <= st && !confirm('익일 ' + v + ' 종료로 저장할까요?')) return;
+        seq = seq.then(function () {{ return api('/events/' + id + '/end', {{ end: v }}); }});
+      }} else {{
+        seq = seq.then(function () {{ return api('/events/' + id + '/end', {{ end: null }}); }});
+      }}
+    }}
+    if (!dirty.text && !dirty.cat && !dirty.end) {{ closeEdit(); return; }}
+    seq.then(function () {{ location.reload(); }})
+       .catch(function (e) {{ alert(e.message); }});
+  }});
+
+  document.getElementById('hidebtn').addEventListener('click', function () {{
+    if (!selected) return;
+    var hiding = selected.dataset.hidden !== '1';
+    var msg = hiding ? '이 기록을 숨길까요? 타임라인·통계에서 제외됩니다.\\n(숨김 보기에서 되돌릴 수 있어요)'
+                     : '숨김을 해제할까요?';
+    if (!confirm(msg)) return;
+    api('/events/' + selected.dataset.id + '/hide', {{ hidden: hiding }})
+      .then(function () {{ location.reload(); }})
+      .catch(function (e) {{ alert(e.message); }});
+  }});
+
+  document.getElementById('closebtn').addEventListener('click', closeEdit);
+
+  document.getElementById('datepick').addEventListener('change', function () {{
+    if (this.value) location.href = '/timeline?date=' + this.value + '&days=' + DAYS + HQ;
+  }});
+  document.getElementById('dayspick').addEventListener('change', function () {{
+    location.href = '/timeline?date={start_date}&days=' + this.value + HQ;
+  }});
+
+  function todayStr() {{
+    var now = new Date();
+    return now.getFullYear() + '-' + String(now.getMonth() + 1).padStart(2, '0') + '-' +
+           String(now.getDate()).padStart(2, '0');
+  }}
+  function scrollToMin(min) {{
+    var rect = layout.getBoundingClientRect();
+    var target = rect.top + window.scrollY + min * ppm - window.innerHeight / 2;
+    window.scrollTo({{ top: Math.max(0, target), behavior: 'smooth' }});
+  }}
+  document.getElementById('gotonow').addEventListener('click', function () {{
+    var ds = todayStr();
+    if (document.querySelector('.canvas[data-date="' + ds + '"]')) {{
+      var now = new Date();
+      scrollToMin((now.getHours() - {DAY_START_HOUR}) * 60 + now.getMinutes());
+    }} else {{
+      location.href = '/timeline?date=' + ds + '&days=' + DAYS + HQ + '#now';
+    }}
+  }});
+
+  // 현재 시각 표시선 (오늘 컬럼에만)
+  function nowline() {{
+    document.querySelectorAll('.nowline').forEach(function (n) {{ n.remove(); }});
+    var now = new Date();
+    var c = document.querySelector('.canvas[data-date="' + todayStr() + '"]');
+    if (!c) return;
+    var min = (now.getHours() - {DAY_START_HOUR}) * 60 + now.getMinutes();
+    if (min < 0 || min > {TOTAL_MIN}) return;
+    var l = document.createElement('div');
+    l.className = 'nowline';
+    l.style.top = 'calc(' + min + ' * var(--ppm))';
+    c.appendChild(l);
+  }}
+  nowline();
+  setInterval(nowline, 60000);
+
+  // 최초 로드 시 보기 좋은 위치로 스크롤 (오늘: 현재-2h, 그 외: 06시)
+  (function initialScroll() {{
+    var min;
+    if (location.hash === '#now' || document.querySelector('.canvas[data-date="' + todayStr() + '"]')) {{
+      var now = new Date();
+      min = Math.max(0, (now.getHours() - 2) * 60 + now.getMinutes());
+    }} else {{
+      min = 6 * 60;
+    }}
+    var rect = layout.getBoundingClientRect();
+    window.scrollTo(0, Math.max(0, rect.top + window.scrollY + min * ppm - 60));
+  }})();
+}})();
+</script>
+</body>
+</html>"""
+
+
+@app.get("/timeline", response_class=HTMLResponse)
+def get_timeline(
+    date: Optional[str] = Query(default=None),
+    days: int = Query(default=1, ge=1, le=7),
+    hidden: int = Query(default=0),
+):
+    date = date or now_kst().strftime("%Y-%m-%d")
+    try:
+        datetime.strptime(date, "%Y-%m-%d")
+    except ValueError:
+        return HTMLResponse("<h1>잘못된 날짜 형식 (YYYY-MM-DD)</h1>", status_code=400)
+    return HTMLResponse(
+        render_timeline(date, days, bool(hidden)), headers={"Cache-Control": "no-store"}
+    )
+
+
+@app.get("/timeline/fc", response_class=HTMLResponse)
+def get_timeline_fc():
+    # FullCalendar 기반 타임라인 (실험용 보존)
+    html = (ROOT / "app" / "timeline_fc.html").read_text(encoding="utf-8")
+    return HTMLResponse(html, headers={"Cache-Control": "no-store"})
+
+
+@app.get("/api/blocks")
+def api_blocks(start: str, end: str):
+    """FullCalendar용 이벤트 소스. [start, end) 범위의 (일 단위 클리핑된) 블록과 합계."""
+    try:
+        d0 = datetime.strptime(start, "%Y-%m-%d")
+        d1 = datetime.strptime(end, "%Y-%m-%d")
+    except ValueError:
+        return JSONResponse({"error": "bad date"}, status_code=400)
+    n = (d1 - d0).days
+    if n < 1 or n > 31:
+        return JSONResponse({"error": "bad range"}, status_code=400)
+
+    events, totals = [], {}
+    for i in range(n):
+        ds = (d0 + timedelta(days=i)).strftime("%Y-%m-%d")
+        for b in build_blocks(ds):
+            if b["empty"] or b["hidden"]:
+                events.append(
+                    {
+                        "id": "",
+                        "title": "빈 시간",
+                        "start": b["start"].isoformat(),
+                        "end": b["end"].isoformat(),
+                        "classNames": ["evt-empty"],
+                        "backgroundColor": "transparent",
+                        "borderColor": "#e0e0e0",
+                        "textColor": "#80868b",
+                        "extendedProps": {"empty": True, "endHHMM": "", "category": ""},
+                    }
+                )
+                continue
+            key = b["category"] or UNCATEGORIZED
+            totals[key] = totals.get(key, 0) + _visible_minutes(b)
+            color = category_color(b["category"])
+            prefix = "↪ " if b["carry"] else ""
+            events.append(
+                {
+                    "id": str(b["id"]),
+                    "title": prefix + b["text"] + (" · 진행 중" if b["ongoing"] else ""),
+                    "start": b["start"].isoformat(),
+                    "end": b["end"].isoformat(),
+                    "classNames": ["evt-fixed" if b["explicit_end"] else "evt-auto"],
+                    "backgroundColor": color,
+                    "borderColor": color,
+                    "textColor": _text_on(color),
+                    "extendedProps": {
+                        "empty": False,
+                        "endHHMM": b["explicit_hhmm"],
+                        "category": key,
+                    },
+                }
+            )
+    colors = {k: category_color(None if k == UNCATEGORIZED else k) for k in totals}
+    return {"events": events, "totals": totals, "colors": colors}
+
+
+def render_stats(end_date: str) -> str:
+    """직전 7일 카테고리 통계. 스택 바(24h 정규화) + 합계 표 + 킬링타임 비율."""
+    end = datetime.strptime(end_date, "%Y-%m-%d")
+    dates = [(end - timedelta(days=6 - i)).strftime("%Y-%m-%d") for i in range(7)]
+    prev_end = (end - timedelta(days=7)).strftime("%Y-%m-%d")
+    next_end = (end + timedelta(days=7)).strftime("%Y-%m-%d")
+    today = now_kst().strftime("%Y-%m-%d")
+
+    order = CATEGORIES + [UNCATEGORIZED]
+    per_day: dict[str, dict[str, int]] = {}
+    totals: dict[str, int] = {}
+    for d in dates:
+        day_tot: dict[str, int] = {}
+        for b in build_blocks(d):
+            if b["empty"] or b["hidden"]:
+                continue
+            key = b["category"] or UNCATEGORIZED
+            day_tot[key] = day_tot.get(key, 0) + _visible_minutes(b)
+            totals[key] = totals.get(key, 0) + _visible_minutes(b)
+        per_day[d] = day_tot
+
+    bar_h = 264  # 24h → 264px (1분 = 0.183px). 미기록 시간은 여백으로 남김
+    cols = []
+    for d in dates:
+        segs = []
+        for cat in order:
+            m = per_day[d].get(cat, 0)
+            if m <= 0:
+                continue
+            color = category_color(None if cat == UNCATEGORIZED else cat)
+            h = max(m * bar_h / TOTAL_MIN, 2)
+            t = f"{m // 60}시간 {m % 60}분" if m >= 60 else f"{m}분"
+            segs.append(
+                f'<div class="seg" style="height:{h:.1f}px;background:{color}" '
+                f'title="{html_lib.escape(cat)} {t}"></div>'
+            )
+        wd = WEEKDAYS[datetime.strptime(d, "%Y-%m-%d").weekday()]
+        today_cls = " today" if d == today else ""
+        cols.append(
+            f'<div class="col"><div class="barwrap"><div class="bar">{"".join(segs)}</div></div>'
+            f'<a class="daylabel{today_cls}" href="/timeline?date={d}&days=1">'
+            f"{int(d[5:7])}/{int(d[8:10])}<br>({wd})</a></div>"
+        )
+
+    recorded = sum(totals.values())
+    kill = totals.get("킬링타임", 0)
+    kill_pct = round(kill * 100 / recorded) if recorded else 0
+    kill_t = f"{kill // 60}시간 {kill % 60}분" if kill >= 60 else f"{kill}분"
+
+    rows = []
+    for cat, m in sorted(totals.items(), key=lambda kv: -kv[1]):
+        color = category_color(None if cat == UNCATEGORIZED else cat)
+        t = f"{m // 60}시간 {m % 60}분" if m >= 60 else f"{m}분"
+        avg = m // 7
+        avg_t = f"{avg // 60}시간 {avg % 60}분" if avg >= 60 else f"{avg}분"
+        pct = round(m * 100 / recorded) if recorded else 0
+        rows.append(
+            f'<tr><td><span class="dot" style="background:{color}"></span>'
+            f"{html_lib.escape(cat)}</td><td>{t}</td><td>{avg_t}</td><td>{pct}%</td></tr>"
+        )
+    table_html = "".join(rows) or '<tr><td colspan="4">기록 없음</td></tr>'
+
+    legend_html = "".join(
+        _chip(k, None) for k in order if totals.get(k, 0) > 0
+    )
+
+    return f"""<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>주간 통계 · {dates[0]} ~ {end_date}</title>
+<link rel="manifest" href="/static/manifest.webmanifest">
+<link rel="apple-touch-icon" href="/static/icon-180.png">
+<meta name="theme-color" content="#2563eb">
+<style>
+  :root {{ --accent: #2563eb; --text: #1f2328; --muted: #6b7280; --line: #eceef1; }}
+  * {{ box-sizing: border-box; }}
+  body {{ font-family: "Pretendard Variable", Pretendard, -apple-system, BlinkMacSystemFont,
+                       "Apple SD Gothic Neo", "Noto Sans KR", "Segoe UI", "Malgun Gothic", sans-serif;
+          margin: 0; background: #fff; color: var(--text);
+          -webkit-font-smoothing: antialiased; letter-spacing: -0.01em; padding-bottom: 24px; }}
+  .topbar {{ position: sticky; top: 0; background: #fff; border-bottom: 1px solid var(--line);
+             padding: 10px 12px; display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }}
+  .topbar .nav {{ text-decoration: none; color: var(--muted); font-size: 18px; padding: 4px 8px; }}
+  .topbar h1 {{ font-size: 15px; margin: 0; font-weight: 700; }}
+  .topbar .range {{ font-size: 12.5px; color: var(--muted); font-variant-numeric: tabular-nums; }}
+  .topbar a.tl {{ margin-left: auto; text-decoration: none; color: var(--accent);
+                  font-weight: 600; font-size: 14px; border: 1px solid var(--line);
+                  border-radius: 9px; padding: 6px 10px; }}
+  .hero {{ margin: 14px 12px 4px; padding: 12px 14px; border: 1px solid var(--line);
+           border-radius: 12px; background: #fafafa; font-size: 14px; }}
+  .hero b {{ color: {category_color("킬링타임")}; }}
+  .chart {{ display: flex; gap: 6px; padding: 14px 12px 0; align-items: flex-end; }}
+  .col {{ flex: 1; min-width: 0; text-align: center; }}
+  .barwrap {{ height: {bar_h}px; display: flex; align-items: flex-end;
+              background: #f8f9fa; border-radius: 8px; }}
+  .bar {{ width: 100%; display: flex; flex-direction: column-reverse; gap: 2px;
+          padding: 2px; }}
+  .seg {{ border-radius: 3px; }}
+  .daylabel {{ display: inline-block; margin-top: 6px; font-size: 12px; color: var(--muted);
+               text-decoration: none; line-height: 1.3; }}
+  .daylabel.today {{ color: var(--accent); font-weight: 700; }}
+  .legend {{ display: flex; flex-wrap: wrap; gap: 5px; padding: 12px; }}
+  .chip {{ border-radius: 999px; padding: 3px 10px; font-size: 12.5px; font-weight: 600;
+           white-space: nowrap; border: 1px solid transparent; }}
+  table {{ width: calc(100% - 24px); margin: 4px 12px; border-collapse: collapse; font-size: 13.5px; }}
+  th, td {{ text-align: left; padding: 8px 6px; border-bottom: 1px solid var(--line); }}
+  th {{ color: var(--muted); font-size: 12px; font-weight: 600; }}
+  td:nth-child(n+2), th:nth-child(n+2) {{ text-align: right; font-variant-numeric: tabular-nums; }}
+  .dot {{ display: inline-block; width: 10px; height: 10px; border-radius: 3px;
+          margin-right: 7px; vertical-align: -1px; }}
+</style>
+</head>
+<body>
+<div class="topbar">
+  <a class="nav" href="/stats?end={prev_end}">◀</a>
+  <div>
+    <h1>주간 통계</h1>
+    <div class="range">{dates[0]} ~ {end_date}</div>
+  </div>
+  <a class="nav" href="/stats?end={next_end}">▶</a>
+  <a class="tl" href="/timeline">타임라인</a>
+</div>
+<div class="hero">킬링타임 <b>{kill_t}</b> · 기록 시간의 <b>{kill_pct}%</b>
+  <span style="color:var(--muted)"> (총 기록 {recorded // 60}시간 {recorded % 60}분)</span></div>
+<div class="chart">{"".join(cols)}</div>
+<div class="legend">{legend_html}</div>
+<table>
+  <tr><th>카테고리</th><th>합계</th><th>일평균</th><th>비율</th></tr>
+  {table_html}
+</table>
+</body>
+</html>"""
+
+
+@app.get("/stats", response_class=HTMLResponse)
+def get_stats(end: Optional[str] = Query(default=None)):
+    end = end or now_kst().strftime("%Y-%m-%d")
+    try:
+        datetime.strptime(end, "%Y-%m-%d")
+    except ValueError:
+        return HTMLResponse("<h1>잘못된 날짜 형식 (YYYY-MM-DD)</h1>", status_code=400)
+    return HTMLResponse(render_stats(end), headers={"Cache-Control": "no-store"})
