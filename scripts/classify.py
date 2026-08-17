@@ -9,7 +9,9 @@
 
 import json
 import logging
+import os
 import re
+import shutil
 import sqlite3
 import subprocess
 import sys
@@ -27,7 +29,23 @@ from app.constants import CATEGORIES  # noqa: E402  (서버와 동일 목록 공
 
 DB_PATH = ROOT / "data" / "activity.db"
 PROMPT_PATH = ROOT / "prompts" / "classify.md"
-CLAUDE_BIN = "CLAUDE_BIN_PATH"
+
+
+def _load_env() -> None:
+    """.env를 환경변수로 로드 (systemd 타이머 단독 실행 경로에서도 필요)."""
+    env_file = ROOT / ".env"
+    if not env_file.exists():
+        return
+    for line in env_file.read_text(encoding="utf-8").splitlines():
+        line = line.strip()
+        if line and not line.startswith("#") and "=" in line:
+            k, v = line.split("=", 1)
+            os.environ.setdefault(k.strip(), v.strip())
+
+
+_load_env()
+# claude CLI 경로는 환경에 따라 다르므로 .env/환경변수로 지정 (없으면 PATH 탐색)
+CLAUDE_BIN = os.environ.get("CLAUDE_BIN") or shutil.which("claude") or "claude"
 
 logger = logging.getLogger("classify")
 logger.setLevel(logging.INFO)
