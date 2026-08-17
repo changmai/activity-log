@@ -751,8 +751,8 @@ def render_timeline(start_date: str, days: int, show_hidden: bool) -> str:
   .block {{ position: absolute; left: 2px; right: 2px; border-radius: 7px; padding: 2px 7px;
             font-size: 12px; line-height: 1.35; font-weight: 600; overflow: hidden; z-index: 1;
             transition: box-shadow .18s ease; }}
-  .block.empty {{ background: #f4f4f5; color: #a9a9af;
-                  border-left: 3px solid #e2e2e5; font-weight: 500; }}
+  .block.empty {{ background: #e3e3e8; color: #6e6e76;
+                  border-left: 3px solid #c7c7cd; font-weight: 500; }}
   .block.hiddenblk {{ opacity: .45; }}
   .block.focus {{ height: auto !important; min-height: 22px; z-index: 5;
                   left: 2px !important; right: 2px !important; width: auto !important;
