@@ -791,22 +791,31 @@ def render_timeline(start_date: str, days: int, show_hidden: bool) -> str:
   @keyframes sheetup {{ from {{ transform: translateY(60%); opacity: .4; }}
                         to {{ transform: none; opacity: 1; }} }}
   .ebrow {{ display: flex; align-items: center; gap: 7px; flex-wrap: wrap; }}
-  #editstart {{ font-size: 12px; color: var(--muted); white-space: nowrap;
-                font-variant-numeric: tabular-nums; font-weight: 600; }}
   #edittext {{ flex: 1; min-width: 0; font-size: 15px; padding: 9px 11px; border: none;
                border-radius: 10px; background: var(--fill); color: var(--text); }}
   #edittext:focus {{ outline: 2px solid rgba(0,122,255,.5); }}
-  #editcat {{ flex: 1; min-width: 110px; height: 38px; font-size: 14px; border: none;
+  #editcat {{ flex: 1; min-width: 108px; height: 46px; font-size: 14px; border: none;
               border-radius: 10px; background: var(--fill); color: var(--text); padding: 0 10px;
               -webkit-appearance: none; appearance: none; }}
-  #endtime {{ font-size: 14px; padding: 4px 8px; border: none; border-radius: 10px;
-              min-width: 88px; min-height: 38px; background: var(--fill); color: var(--text);
-              -webkit-appearance: none; appearance: none; font-variant-numeric: tabular-nums; }}
+  /* 시작 → 종료를 하나의 그룹으로 */
+  #timerange {{ display: flex; align-items: center; background: var(--fill);
+                border-radius: 10px; padding: 5px 4px; gap: 2px; }}
+  .tcell {{ display: flex; flex-direction: column; align-items: center; gap: 0;
+            padding: 0 10px; }}
+  .tlabel {{ font-size: 10px; font-weight: 600; color: var(--muted);
+             text-transform: uppercase; letter-spacing: .04em; }}
+  #editstart {{ font-size: 16px; font-weight: 600; color: var(--text);
+                font-variant-numeric: tabular-nums; line-height: 1.3; }}
+  .tarrow {{ color: var(--muted); font-size: 14px; padding-bottom: 2px; }}
+  #endtime {{ font-size: 16px; font-weight: 600; padding: 0; border: none;
+              background: transparent; color: var(--accent); width: 72px; text-align: center;
+              -webkit-appearance: none; appearance: none; font-variant-numeric: tabular-nums;
+              line-height: 1.3; }}
   #editbar button {{ font-size: 14px; padding: 9px 13px; border: none; border-radius: 10px;
                      background: var(--fill); white-space: nowrap; cursor: pointer;
                      color: var(--accent); font-weight: 600; }}
   #editbar button:active {{ opacity: .5; }}
-  #editbar #endsave {{ background: var(--accent); color: #fff; }}
+  #editbar #endsave {{ background: var(--accent); color: #fff; flex: 1; }}
   #hidebtn {{ color: var(--red); background: rgba(255,59,48,.1); }}
 </style>
 </head>
@@ -835,15 +844,20 @@ def render_timeline(start_date: str, days: int, show_hidden: bool) -> str:
 </div>
 <div id="editbar" hidden>
   <div class="ebrow">
-    <span id="editstart"></span>
     <input type="text" id="edittext" placeholder="텍스트 수정">
   </div>
   <div class="ebrow">
+    <div id="timerange">
+      <div class="tcell"><span class="tlabel">시작</span><span id="editstart">–</span></div>
+      <div class="tarrow">→</div>
+      <div class="tcell"><span class="tlabel">종료</span><input type="time" id="endtime"></div>
+    </div>
     <select id="editcat">
       <option value="">자동 재분류(다음 배치)</option>
       {cat_options}
     </select>
-    <input type="time" id="endtime">
+  </div>
+  <div class="ebrow">
     <button id="endsave">저장</button>
     <button id="hidebtn">숨김</button>
     <button id="closebtn">✕</button>
@@ -1001,7 +1015,7 @@ def render_timeline(start_date: str, days: int, show_hidden: bool) -> str:
   function openEdit(b) {{
     selected = b;
     dirty = {{ text: false, cat: false, end: false }};
-    document.getElementById('editstart').textContent = (b.dataset.start || '') + ' 시작';
+    document.getElementById('editstart').textContent = b.dataset.start || '–';
     edittext.value = b.dataset.text || '';
     editcat.value = b.dataset.category || '';
     endtime.value = b.dataset.end || '';
