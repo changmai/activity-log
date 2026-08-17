@@ -668,6 +668,10 @@ def render_timeline(start_date: str, days: int, show_hidden: bool) -> str:
     days_options = "".join(
         f'<option value="{n}"{" selected" if n == days else ""}>{n}일</option>' for n in range(1, 8)
     )
+    endh_options = '<option value="">–</option>' + "".join(
+        f'<option value="{h:02d}">{h:02d}</option>' for h in range(24)
+    )
+    endm_options = "".join(f'<option value="{m:02d}">{m:02d}</option>' for m in range(60))
     cat_options = "".join(f'<option value="{c}">{c}</option>' for c in CATEGORIES)
     hidden_toggle = (
         f'<a class="hlink" href="/timeline?date={start_date}&days={days}">숨김 닫기</a>'
@@ -807,10 +811,14 @@ def render_timeline(start_date: str, days: int, show_hidden: bool) -> str:
   #editstart {{ font-size: 16px; font-weight: 600; color: var(--text);
                 font-variant-numeric: tabular-nums; line-height: 1.3; }}
   .tarrow {{ color: var(--muted); font-size: 14px; padding-bottom: 2px; }}
-  #endtime {{ font-size: 16px; font-weight: 600; padding: 0; border: none;
-              background: transparent; color: var(--accent); width: 72px; text-align: center;
-              -webkit-appearance: none; appearance: none; font-variant-numeric: tabular-nums;
-              line-height: 1.3; }}
+  /* 종료 시/분: 커스텀 select (네이티브 time input은 데스크톱 UI가 조악하고 iOS에서 빈 값 표시가 깨짐) */
+  .tsel {{ display: flex; align-items: center; }}
+  #endh, #endm {{ font-size: 16px; font-weight: 600; border: none; background: transparent;
+                  color: var(--accent); padding: 0 1px; cursor: pointer;
+                  -webkit-appearance: none; appearance: none;
+                  font-variant-numeric: tabular-nums; line-height: 1.3; text-align: center; }}
+  .colon {{ color: var(--accent); font-weight: 600; font-size: 16px; }}
+  .tsel.noend .colon, .tsel.noend #endm {{ display: none; }}
   #editbar button {{ font-size: 14px; padding: 9px 13px; border: none; border-radius: 10px;
                      background: var(--fill); white-space: nowrap; cursor: pointer;
                      color: var(--accent); font-weight: 600; }}
@@ -850,7 +858,13 @@ def render_timeline(start_date: str, days: int, show_hidden: bool) -> str:
     <div id="timerange">
       <div class="tcell"><span class="tlabel">시작</span><span id="editstart">–</span></div>
       <div class="tarrow">→</div>
-      <div class="tcell"><span class="tlabel">종료</span><input type="time" id="endtime"></div>
+      <div class="tcell"><span class="tlabel">종료</span>
+        <span class="tsel" id="tsel">
+          <select id="endh">{endh_options}</select>
+          <span class="colon">:</span>
+          <select id="endm">{endm_options}</select>
+        </span>
+      </div>
     </div>
     <select id="editcat">
       <option value="">자동 재분류(다음 배치)</option>
@@ -1002,15 +1016,19 @@ def render_timeline(start_date: str, days: int, show_hidden: bool) -> str:
   var dirty = {{ text: false, cat: false, end: false }};
   var edittext = document.getElementById('edittext');
   var editcat = document.getElementById('editcat');
-  var endtime = document.getElementById('endtime');
+  var endh = document.getElementById('endh');
+  var endm = document.getElementById('endm');
+  var tsel = document.getElementById('tsel');
+
+  function syncTsel() {{ tsel.classList.toggle('noend', endh.value === ''); }}
 
   edittext.addEventListener('input', function () {{ dirty.text = true; }});
   edittext.addEventListener('keydown', function (e) {{
     if (e.key === 'Enter') {{ e.preventDefault(); saveAll(); }}  // 엔터로 바로 저장
   }});
   editcat.addEventListener('change', function () {{ dirty.cat = true; saveAll(); }});  // 선택 즉시 저장
-  endtime.addEventListener('input', function () {{ dirty.end = true; }});
-  endtime.addEventListener('change', function () {{ dirty.end = true; }});
+  endh.addEventListener('change', function () {{ dirty.end = true; syncTsel(); }});
+  endm.addEventListener('change', function () {{ dirty.end = true; }});
 
   function openEdit(b) {{
     selected = b;
@@ -1018,7 +1036,10 @@ def render_timeline(start_date: str, days: int, show_hidden: bool) -> str:
     document.getElementById('editstart').textContent = b.dataset.start || '–';
     edittext.value = b.dataset.text || '';
     editcat.value = b.dataset.category || '';
-    endtime.value = b.dataset.end || '';
+    var end = b.dataset.end || '';
+    endh.value = end ? end.slice(0, 2) : '';
+    endm.value = end ? end.slice(3, 5) : '00';
+    syncTsel();
     document.getElementById('hidebtn').textContent = b.dataset.hidden === '1' ? '숨김 해제' : '숨김';
     editbar.hidden = false;
     document.body.style.paddingBottom = '140px';
@@ -1071,7 +1092,7 @@ def render_timeline(start_date: str, days: int, show_hidden: bool) -> str:
       seq = seq.then(function () {{ return api('/events/' + id + '/category', {{ category: c || null }}); }});
     }}
     if (dirty.end) {{
-      var v = endtime.value;
+      var v = endh.value === '' ? '' : endh.value + ':' + endm.value;
       if (v) {{
         var st = selected.dataset.start || '';
         if (st && v <= st && !confirm('익일 ' + v + ' 종료로 저장할까요?')) return;
