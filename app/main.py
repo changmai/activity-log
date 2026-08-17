@@ -172,6 +172,8 @@ def set_event_end(event_id: int, body: EndIn, x_requested_with: str = Header(def
                 hh, mm = int(value[:2]), int(value[3:5])
             except ValueError:
                 return JSONResponse({"ok": False, "error": "잘못된 시각 형식"}, status_code=400)
+            if hh > 23 or mm > 59:
+                return JSONResponse({"ok": False, "error": "잘못된 시각 형식"}, status_code=400)
             start_min = start.replace(second=0, microsecond=0)
             end_dt = start.replace(hour=hh, minute=mm, second=0, microsecond=0)
             if end_dt == start_min:
@@ -229,7 +231,10 @@ def set_event_text(event_id: int, body: TextIn, x_requested_with: str = Header(d
         new_text = (body.text or "").strip() or None
         if new_text == row["raw_text"]:
             new_text = None  # 원문과 같으면 저장하지 않음
-        # 텍스트가 바뀌면 카테고리를 리셋해 다음 배치가 교정된 텍스트로 재분류 (effective_ts 유지)
+        if new_text == row["display_text"]:
+            # 실제 변경 없음 — 카테고리를 건드리지 않고 종료 (no-op 저장 보호)
+            return {"ok": True, "display_text": new_text}
+        # 텍스트가 실제로 바뀔 때만 카테고리 리셋 → 다음 배치가 교정된 텍스트로 재분류 (effective_ts 유지)
         conn.execute(
             "UPDATE events SET display_text = ?, category = NULL, tags = NULL WHERE id = ?",
             (new_text, event_id),
@@ -316,7 +321,10 @@ def _compute_end(start: datetime, row: sqlite3.Row, nxt: Optional[datetime], now
     explicit = parse_ts(row["end_ts"]) if row["end_ts"] else None
     is_empty = row["raw_text"].strip().lower() in END_MARKERS  # 마커 판정은 raw_text 고정
     has_explicit = explicit is not None and not is_empty
-    end = min(max(explicit, start), cap) if has_explicit else natural
+    # 명시적 종료의 상한은 분기와 무관: 사용자가 입력한 종료는 다음 기록이 며칠 뒤여도
+    # 원본일 24:00으로 절단하지 않는다 (유령 이월 방지는 자동 연장에만 적용)
+    exp_cap = min(nxt, limit) if nxt is not None else limit
+    end = min(max(explicit, start), exp_cap) if has_explicit else natural
     return end, has_explicit, explicit, natural
 
 
@@ -375,7 +383,7 @@ def build_blocks(date: str) -> list[dict]:
         p_is_empty = prow["raw_text"].strip().lower() in END_MARKERS
         if pstart is not None and not p_is_empty:
             p_next = events[0][0] if events else global_next
-            pend, p_has_exp, p_exp, _ = _compute_end(pstart, prow, p_next, now)
+            pend, p_has_exp, p_exp, p_natural = _compute_end(pstart, prow, p_next, now)
             if pend > day0:
                 p_ongoing = (
                     not events and global_next is None and not p_has_exp
@@ -384,6 +392,19 @@ def build_blocks(date: str) -> list[dict]:
                 blk = _make_block(prow, day0, min(pend, day1), has_explicit=p_has_exp,
                                   explicit=p_exp, ongoing=p_ongoing, carry=True)
                 blocks.append(blk)
+            # 명시 종료 후 다음 활동까지의 공백이 이 날짜에 걸치면 빈 시간으로 표시
+            if p_has_exp:
+                gap_start = max(min(pend, day1), day0)
+                gap_end = min(p_natural, day1)
+                if (gap_end - gap_start).total_seconds() > 30:
+                    blocks.append(
+                        {
+                            "id": None, "start": gap_start, "end": gap_end, "orig_start": None,
+                            "text": "", "category": None, "empty": True, "hidden": False,
+                            "explicit_end": False, "explicit_hhmm": "", "ongoing": False,
+                            "carry": False,
+                        }
+                    )
 
     for i, (start, row) in enumerate(events):
         nxt = events[i + 1][0] if i + 1 < len(events) else global_next
@@ -1059,7 +1080,8 @@ def api_blocks(start: str, end: str):
             prefix = "↪ " if b["carry"] else ""
             events.append(
                 {
-                    "id": str(b["id"]),
+                    # 이월 블록은 원본과 다른 id로 방출 (FullCalendar가 동일 id를 연동 취급하므로)
+                    "id": f'{b["id"]}c' if b["carry"] else str(b["id"]),
                     "title": prefix + b["text"] + (" · 진행 중" if b["ongoing"] else ""),
                     "start": b["start"].isoformat(),
                     "end": b["end"].isoformat(),

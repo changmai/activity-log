@@ -13,8 +13,12 @@ import re
 import sqlite3
 import subprocess
 import sys
+from datetime import datetime
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
+from zoneinfo import ZoneInfo
+
+KST = ZoneInfo("Asia/Seoul")
 
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
@@ -98,11 +102,32 @@ def main() -> int:
         return 1
 
     valid_ids = {r["id"] for r in rows}
+    ts_map = {r["id"]: r["ts"] for r in rows}
+
+    def valid_effective_ts(value, base_iso):
+        """모델이 준 effective_ts 검증: ISO 파싱 가능 + 원래 시각 ±48h 이내만 허용.
+        잘못된 값이 저장되면 이벤트가 타임라인 어디에도 안 보이게 되므로 무시한다."""
+        if not value:
+            return None
+        try:
+            dt = datetime.fromisoformat(value)
+            base = datetime.fromisoformat(base_iso)
+        except (ValueError, TypeError):
+            return None
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=KST)
+        if base.tzinfo is None:
+            base = base.replace(tzinfo=KST)
+        if abs((dt - base).total_seconds()) > 48 * 3600:
+            return None
+        return dt.isoformat(timespec="seconds")
+
     updated, skipped = 0, 0
     for item in results:
         if item.get("id") not in valid_ids or item.get("category") not in CATEGORIES:
             skipped += 1
             continue
+        eff = valid_effective_ts(item.get("effective_ts"), ts_map[item["id"]])
         # 재분류 시 기존 effective_ts는 보존 (모델이 새 값을 주지 않으면 유지)
         conn.execute(
             "UPDATE events SET category = ?, tags = ?, "
@@ -111,7 +136,7 @@ def main() -> int:
             (
                 item["category"],
                 json.dumps(item.get("tags") or [], ensure_ascii=False),
-                item.get("effective_ts"),
+                eff,
                 item["id"],
             ),
         )
