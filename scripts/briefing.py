@@ -22,8 +22,6 @@ sys.path.insert(0, str(ROOT))
 from app.constants import UNCATEGORIZED  # noqa: E402
 from app.main import _visible_minutes, build_blocks, now_kst, union_minutes  # noqa: E402
 
-TAILSCALE_URL = "http://SERVER_HOST:8787"
-
 logger = logging.getLogger("briefing")
 logger.setLevel(logging.INFO)
 _h = RotatingFileHandler(ROOT / "logs" / "briefing.log", maxBytes=500_000, backupCount=2, encoding="utf-8")
@@ -42,6 +40,10 @@ def load_env() -> dict:
                 k, v = line.split("=", 1)
                 env[k.strip()] = v.strip()
     return env
+
+
+# 링크용 서버 주소는 .env의 TAILSCALE_URL에서 — IP를 저장소에 커밋하지 않기 위함
+TAILSCALE_URL = load_env().get("TAILSCALE_URL", "http://localhost:8787")
 
 
 def tg(token: str, method: str, payload: dict | None = None) -> dict:
