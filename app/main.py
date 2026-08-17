@@ -497,6 +497,21 @@ def category_color(category: Optional[str]) -> str:
     return PALETTE[digest[0] % len(PALETTE)]
 
 
+def _rgb(color: str) -> tuple[int, int, int]:
+    return tuple(int(color[i:i + 2], 16) for i in (1, 3, 5))  # type: ignore[return-value]
+
+
+def _tint(color: str, alpha: float) -> str:
+    r, g, b = _rgb(color)
+    return f"rgba({r},{g},{b},{alpha})"
+
+
+def _shade(color: str, f: float = 0.38) -> str:
+    """카테고리 색을 어둡게 — 틴트 배경 위 텍스트용 (애플 캘린더 방식)."""
+    r, g, b = _rgb(color)
+    return "#%02x%02x%02x" % (int(r * (1 - f)), int(g * (1 - f)), int(b * (1 - f)))
+
+
 def _text_on(color: str) -> str:
     """배경색 명도에 따라 흰/검 텍스트 선택 (텍스트 가독성)."""
     r, g, b = (int(color[i:i + 2], 16) / 255 for i in (1, 3, 5))
@@ -560,7 +575,15 @@ def render_day_column(date: str, blocks: list[dict], show_hidden: bool) -> str:
             cls = "block " + ("fixedend" if b["explicit_end"] else "auto")
             if b["hidden"]:
                 cls += " hiddenblk"
-            style = f"background:{color};color:{_text_on(color)};"
+            # 애플 캘린더 스타일: 틴트 배경 + 좌측 컬러 바 + 진한 컬러 텍스트
+            style = (
+                f"background:{_tint(color, 0.16)};color:{_shade(color)};"
+                f"border-left:3px solid {color};"
+            )
+            if b["explicit_end"]:
+                style += f"border-bottom:2px solid {color};"
+            else:
+                style += f"border-bottom:1px dashed {_tint(color, 0.6)};"
             start_label = (b["orig_start"] or b["start"]).strftime("%H:%M")
             prefix = "↪ " if b["carry"] else ""
             end_str = f'-{b["explicit_hhmm"]}' if b["explicit_end"] else ""
@@ -623,7 +646,8 @@ def render_timeline(start_date: str, days: int, show_hidden: bool) -> str:
 
     dayheads_html = "".join(
         f'<a class="dayhead{" today" if d == today else ""}" href="/timeline?date={d}&days=1{hq}">'
-        f'{int(d[5:7])}/{int(d[8:10])} ({WEEKDAYS[datetime.strptime(d, "%Y-%m-%d").weekday()]})</a>'
+        f'<span class="wd">{WEEKDAYS[datetime.strptime(d, "%Y-%m-%d").weekday()]}</span>'
+        f'<span class="dn">{int(d[8:10])}</span></a>'
         for d in dates
     )
     columns_html = "".join(render_day_column(d, per_day[d], show_hidden) for d in dates)
@@ -654,37 +678,56 @@ def render_timeline(start_date: str, days: int, show_hidden: bool) -> str:
 <meta name="apple-mobile-web-app-status-bar-style" content="default">
 <meta name="apple-mobile-web-app-title" content="활동 로그">
 <style>
-  :root {{ --ppm: 1.6px; --accent: #2563eb; --text: #1f2328; --muted: #6b7280; --line: #eceef1; }}
+  :root {{ --ppm: 1.6px; --accent: #007aff; --red: #ff3b30; --text: #1c1c1e;
+           --muted: #8e8e93; --line: rgba(60,60,67,.13); --fill: rgba(120,120,128,.12); }}
   * {{ box-sizing: border-box; }}
   /* 줌으로 문서 높이가 바뀔 때 브라우저의 자동 스크롤 보정(scroll anchoring)이
      우리의 수동 보정과 충돌해 화면이 튀므로 비활성화. 당겨서 새로고침도 차단 */
   html {{ overflow-anchor: none; overscroll-behavior-y: contain; }}
-  body {{ font-family: "Pretendard Variable", Pretendard, -apple-system, BlinkMacSystemFont,
-                       "Apple SD Gothic Neo", "Noto Sans KR", "Segoe UI", "Malgun Gothic", sans-serif;
+  body {{ font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", "SF Pro Display",
+                       "Apple SD Gothic Neo", "Pretendard", "Noto Sans KR", "Segoe UI", sans-serif;
           margin: 0; background: #fff; color: var(--text);
-          -webkit-font-smoothing: antialiased; letter-spacing: -0.01em;
+          -webkit-font-smoothing: antialiased; letter-spacing: -0.015em;
           touch-action: pan-y; }}
-  .topbar {{ position: sticky; top: 0; z-index: 20; background: #fff; border-bottom: 1px solid var(--line);
-             padding: 8px 8px 0; }}
+  /* iOS 네비게이션 바: 반투명 + 블러 */
+  .topbar {{ position: sticky; top: 0; z-index: 20;
+             background: rgba(249,249,251,.82);
+             -webkit-backdrop-filter: blur(20px) saturate(180%);
+             backdrop-filter: blur(20px) saturate(180%);
+             border-bottom: 0.5px solid var(--line);
+             padding: 8px 10px 0; }}
   .controls {{ display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }}
-  .controls .nav {{ text-decoration: none; color: var(--muted); font-size: 18px; padding: 6px 10px; }}
-  .controls input[type=date], .controls select, .controls .todaybtn, .zoom button {{
-    height: 34px; font-size: 14px; border: 1px solid var(--line); border-radius: 9px;
-    background: #fff; color: var(--text); padding: 0 9px; }}
-  .controls input[type=date] {{ font-variant-numeric: tabular-nums; }}
-  .controls .todaybtn {{ text-decoration: none; color: var(--accent); font-weight: 600;
+  .controls .nav {{ text-decoration: none; color: var(--accent); font-size: 17px; padding: 6px 8px; }}
+  .controls .nav:active {{ opacity: .35; }}
+  .controls input[type=date], .controls select {{
+    height: 34px; font-size: 14px; border: none; border-radius: 10px;
+    background: var(--fill); color: var(--text); padding: 0 10px;
+    -webkit-appearance: none; appearance: none; }}
+  .controls input[type=date] {{ font-variant-numeric: tabular-nums; font-weight: 500; }}
+  .controls .todaybtn {{ height: 34px; padding: 0 11px; border: none; border-radius: 10px;
+                         background: var(--fill); color: var(--accent);
+                         font-size: 14px; font-weight: 600; text-decoration: none;
                          cursor: pointer; display: inline-flex; align-items: center; }}
+  .controls .todaybtn:active {{ opacity: .5; }}
   .controls .hlink {{ font-size: 12px; color: var(--muted); text-decoration: none; padding: 4px; }}
-  .zoom {{ margin-left: auto; display: flex; gap: 4px; }}
-  .zoom button {{ width: 34px; padding: 0; font-size: 18px; color: var(--muted); cursor: pointer; }}
-  .totals {{ padding: 7px 0; display: flex; flex-wrap: wrap; gap: 5px; }}
-  .chip {{ border-radius: 999px; padding: 3px 10px; font-size: 12.5px; font-weight: 600;
-           white-space: nowrap; border: 1px solid transparent; }}
+  .zoom {{ margin-left: auto; display: flex; gap: 5px; }}
+  .zoom button {{ width: 34px; height: 34px; padding: 0; border: none; border-radius: 50%;
+                  background: var(--fill); color: var(--accent); font-size: 17px;
+                  font-weight: 600; cursor: pointer; }}
+  .zoom button:active {{ opacity: .5; }}
+  .totals {{ padding: 8px 0; display: flex; flex-wrap: wrap; gap: 5px; }}
+  .chip {{ border-radius: 999px; padding: 3.5px 11px; font-size: 12px; font-weight: 600;
+           white-space: nowrap; border: none; letter-spacing: -0.01em; }}
   .dayheads {{ display: flex; margin-left: 44px; }}
-  .dayhead {{ flex: 1; min-width: 0; text-align: center; font-size: 13px; padding: 5px 0;
-              text-decoration: none; color: var(--text); font-weight: 600;
-              border-left: 1px solid var(--line); }}
-  .dayhead.today {{ color: var(--accent); }}
+  .dayhead {{ flex: 1; min-width: 0; display: flex; flex-direction: column; align-items: center;
+              gap: 1px; padding: 4px 0 6px; text-decoration: none; }}
+  .dayhead .wd {{ font-size: 10.5px; font-weight: 600; color: var(--muted);
+                  text-transform: uppercase; letter-spacing: .02em; }}
+  .dayhead .dn {{ font-size: 16px; font-weight: 600; color: var(--text);
+                  width: 27px; height: 27px; line-height: 27px; text-align: center;
+                  border-radius: 50%; font-variant-numeric: tabular-nums; }}
+  .dayhead.today .wd {{ color: var(--red); }}
+  .dayhead.today .dn {{ background: var(--red); color: #fff; font-weight: 700; }}
   .layout {{ display: flex; touch-action: pan-y; }}
   .axis {{ width: 44px; flex: none; position: relative; height: calc({TOTAL_MIN} * var(--ppm)); }}
   .hour {{ position: absolute; right: 6px; transform: translateY(-50%); font-size: 11px;
@@ -692,54 +735,69 @@ def render_timeline(start_date: str, days: int, show_hidden: bool) -> str:
   .daycols {{ display: flex; flex: 1; min-width: 0; }}
   .day {{ flex: 1; min-width: 0; border-left: 1px solid var(--line); }}
   .canvas {{ position: relative; height: calc({TOTAL_MIN} * var(--ppm));
-             background-image: linear-gradient(to bottom, #f1f3f4 1px, transparent 1px);
+             background-image: linear-gradient(to bottom, rgba(60,60,67,.08) 1px, transparent 1px);
              background-size: 100% calc(60 * var(--ppm));
              contain: layout paint; }}
-  .block {{ position: absolute; left: 2px; right: 2px; border-radius: 6px; padding: 1px 6px;
-            font-size: 12px; line-height: 1.35; font-weight: 500; overflow: hidden; z-index: 1; }}
-  .block.empty {{ background: repeating-linear-gradient(45deg, #f6f7f8, #f6f7f8 8px, #eceef1 8px, #eceef1 16px);
-                  color: #9aa1a9; }}
+  .block {{ position: absolute; left: 2px; right: 2px; border-radius: 7px; padding: 2px 7px;
+            font-size: 12px; line-height: 1.35; font-weight: 600; overflow: hidden; z-index: 1;
+            transition: box-shadow .18s ease; }}
+  .block.empty {{ background: rgba(120,120,128,.07); color: #a9a9af;
+                  border-left: 3px solid rgba(120,120,128,.2); font-weight: 500; }}
   .block.hiddenblk {{ opacity: .45; }}
-  .block.focus {{ height: auto !important; min-height: 20px; z-index: 5;
+  .block.focus {{ height: auto !important; min-height: 22px; z-index: 5;
                   left: 2px !important; right: 2px !important; width: auto !important;
-                  outline: 2px solid var(--accent); box-shadow: 0 2px 10px rgba(0,0,0,.35); }}
+                  outline: none;
+                  box-shadow: 0 0 0 2.5px rgba(0,122,255,.55), 0 10px 28px rgba(0,0,0,.16); }}
   .block.focus .bt {{ white-space: normal; }}
   @media (hover: hover) and (pointer: fine) {{
-    .block:hover {{ height: auto !important; min-height: 20px; z-index: 5;
+    .block:hover {{ height: auto !important; min-height: 22px; z-index: 5;
                     left: 2px !important; right: 2px !important; width: auto !important;
-                    outline: 2px solid var(--accent); box-shadow: 0 2px 10px rgba(0,0,0,.35); }}
+                    outline: none;
+                    box-shadow: 0 0 0 2.5px rgba(0,122,255,.55), 0 10px 28px rgba(0,0,0,.16); }}
     .block:hover .bt {{ white-space: normal; }}
   }}
-  .block.fixedend {{ border-bottom: 3px solid rgba(0,0,0,.3); }}
-  .block.auto {{ border-bottom: 1px dashed rgba(0,0,0,.55); }}
+  /* 종료 확정/자동연장 구분은 인라인 스타일(카테고리 색)로 처리 */
   .bt {{ display: block; transform-origin: 0 0;
          white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }}
   html.pinching .bt {{ transform: scaleY(var(--isy, 1)); }}
-  .nowline {{ position: absolute; left: 0; right: 0; height: 0; border-top: 2px solid #ef4444; z-index: 2; }}
+  .nowline {{ position: absolute; left: 0; right: 0; height: 0; border-top: 2px solid var(--red); z-index: 2; }}
   .nowline::before {{ content: ""; position: absolute; left: -4px; top: -5px; width: 8px; height: 8px;
-                      border-radius: 50%; background: #ef4444; }}
-  #editbar {{ position: fixed; left: 0; right: 0; bottom: 0; z-index: 30; background: #fff;
-              border-top: 1px solid var(--line); box-shadow: 0 -4px 16px rgba(0,0,0,.07);
-              display: flex; flex-direction: column; gap: 7px; padding: 10px 12px;
-              padding-bottom: calc(10px + env(safe-area-inset-bottom)); }}
+                      border-radius: 50%; background: var(--red); }}
+  /* iOS 시트 스타일 편집 패널 */
+  #editbar {{ position: fixed; left: 0; right: 0; bottom: 0; z-index: 30;
+              background: rgba(249,249,251,.94);
+              -webkit-backdrop-filter: blur(20px) saturate(180%);
+              backdrop-filter: blur(20px) saturate(180%);
+              border-radius: 14px 14px 0 0;
+              box-shadow: 0 -8px 32px rgba(0,0,0,.14);
+              display: flex; flex-direction: column; gap: 8px; padding: 7px 14px 12px;
+              padding-bottom: calc(12px + env(safe-area-inset-bottom)); }}
   #editbar[hidden] {{ display: none; }}
-  .ebrow {{ display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }}
+  #editbar::before {{ content: ""; align-self: center; width: 36px; height: 5px;
+                      border-radius: 3px; background: rgba(60,60,67,.25); }}
+  @media (prefers-reduced-motion: no-preference) {{
+    #editbar:not([hidden]) {{ animation: sheetup .28s cubic-bezier(.2,.9,.3,1); }}
+  }}
+  @keyframes sheetup {{ from {{ transform: translateY(60%); opacity: .4; }}
+                        to {{ transform: none; opacity: 1; }} }}
+  .ebrow {{ display: flex; align-items: center; gap: 7px; flex-wrap: wrap; }}
   #editstart {{ font-size: 12px; color: var(--muted); white-space: nowrap;
-                font-variant-numeric: tabular-nums; }}
-  #edittext {{ flex: 1; min-width: 0; font-size: 14px; padding: 7px 9px;
-               border: 1px solid var(--line); border-radius: 9px; }}
-  #editcat {{ flex: 1; min-width: 110px; height: 36px; font-size: 14px;
-              border: 1px solid var(--line); border-radius: 9px; background: #fff; }}
-  #endtime {{ font-size: 14px; padding: 4px 6px; border: 1px solid var(--line);
-              border-radius: 9px; min-width: 88px; min-height: 36px; background: #fff;
-              color: var(--text); -webkit-appearance: none; appearance: none;
-              font-variant-numeric: tabular-nums; }}
-  #editbar button {{ font-size: 13.5px; padding: 8px 10px; border: 1px solid var(--line);
-                     border-radius: 9px; background: #fff; white-space: nowrap;
-                     cursor: pointer; color: var(--text); font-weight: 500; }}
-  #editbar #endsave {{ background: var(--accent); color: #fff; border-color: var(--accent);
-                       font-weight: 600; }}
-  #hidebtn {{ color: #b23; }}
+                font-variant-numeric: tabular-nums; font-weight: 600; }}
+  #edittext {{ flex: 1; min-width: 0; font-size: 15px; padding: 9px 11px; border: none;
+               border-radius: 10px; background: var(--fill); color: var(--text); }}
+  #edittext:focus {{ outline: 2px solid rgba(0,122,255,.5); }}
+  #editcat {{ flex: 1; min-width: 110px; height: 38px; font-size: 14px; border: none;
+              border-radius: 10px; background: var(--fill); color: var(--text); padding: 0 10px;
+              -webkit-appearance: none; appearance: none; }}
+  #endtime {{ font-size: 14px; padding: 4px 8px; border: none; border-radius: 10px;
+              min-width: 88px; min-height: 38px; background: var(--fill); color: var(--text);
+              -webkit-appearance: none; appearance: none; font-variant-numeric: tabular-nums; }}
+  #editbar button {{ font-size: 14px; padding: 9px 13px; border: none; border-radius: 10px;
+                     background: var(--fill); white-space: nowrap; cursor: pointer;
+                     color: var(--accent); font-weight: 600; }}
+  #editbar button:active {{ opacity: .5; }}
+  #editbar #endsave {{ background: var(--accent); color: #fff; }}
+  #hidebtn {{ color: var(--red); background: rgba(255,59,48,.1); }}
 </style>
 </head>
 <body>
@@ -1230,42 +1288,55 @@ def render_stats(end_date: str) -> str:
 <link rel="apple-touch-icon" href="/static/icon-180.png">
 <meta name="theme-color" content="#2563eb">
 <style>
-  :root {{ --accent: #2563eb; --text: #1f2328; --muted: #6b7280; --line: #eceef1; }}
+  :root {{ --accent: #007aff; --red: #ff3b30; --text: #1c1c1e; --muted: #8e8e93;
+           --line: rgba(60,60,67,.13); --fill: rgba(120,120,128,.12); }}
   * {{ box-sizing: border-box; }}
-  body {{ font-family: "Pretendard Variable", Pretendard, -apple-system, BlinkMacSystemFont,
-                       "Apple SD Gothic Neo", "Noto Sans KR", "Segoe UI", "Malgun Gothic", sans-serif;
-          margin: 0; background: #fff; color: var(--text);
-          -webkit-font-smoothing: antialiased; letter-spacing: -0.01em; padding-bottom: 24px; }}
-  .topbar {{ position: sticky; top: 0; background: #fff; border-bottom: 1px solid var(--line);
-             padding: 10px 12px; display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }}
-  .topbar .nav {{ text-decoration: none; color: var(--muted); font-size: 18px; padding: 4px 8px; }}
-  .topbar h1 {{ font-size: 15px; margin: 0; font-weight: 700; }}
-  .topbar .range {{ font-size: 12.5px; color: var(--muted); font-variant-numeric: tabular-nums; }}
+  body {{ font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", "SF Pro Display",
+                       "Apple SD Gothic Neo", "Pretendard", "Noto Sans KR", "Segoe UI", sans-serif;
+          margin: 0; background: #f2f2f7; color: var(--text);
+          -webkit-font-smoothing: antialiased; letter-spacing: -0.015em; padding-bottom: 28px; }}
+  .topbar {{ position: sticky; top: 0; z-index: 10;
+             background: rgba(249,249,251,.82);
+             -webkit-backdrop-filter: blur(20px) saturate(180%);
+             backdrop-filter: blur(20px) saturate(180%);
+             border-bottom: 0.5px solid var(--line);
+             padding: 10px 14px; display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }}
+  .topbar .nav {{ text-decoration: none; color: var(--accent); font-size: 17px; padding: 4px 8px; }}
+  .topbar .nav:active {{ opacity: .35; }}
+  .topbar h1 {{ font-size: 17px; margin: 0; font-weight: 700; letter-spacing: -0.02em; }}
+  .topbar .range {{ font-size: 12px; color: var(--muted); font-variant-numeric: tabular-nums; }}
   .topbar a.tl {{ margin-left: auto; text-decoration: none; color: var(--accent);
-                  font-weight: 600; font-size: 14px; border: 1px solid var(--line);
-                  border-radius: 9px; padding: 6px 10px; }}
-  .hero {{ margin: 14px 12px 4px; padding: 12px 14px; border: 1px solid var(--line);
-           border-radius: 12px; background: #fafafa; font-size: 14px; }}
-  .hero b {{ color: {category_color("킬링타임")}; }}
-  .chart {{ display: flex; gap: 6px; padding: 14px 12px 0; align-items: flex-end; }}
+                  font-weight: 600; font-size: 14px; background: var(--fill);
+                  border-radius: 10px; padding: 7px 12px; }}
+  .topbar a.tl:active {{ opacity: .5; }}
+  .card {{ margin: 12px 14px 0; background: #fff; border-radius: 14px;
+           box-shadow: 0 1px 3px rgba(0,0,0,.05); }}
+  .hero {{ padding: 14px 16px; font-size: 14px; color: var(--muted); }}
+  .hero .big {{ display: block; font-size: 26px; font-weight: 700; letter-spacing: -0.03em;
+                color: {category_color("킬링타임")}; font-variant-numeric: tabular-nums;
+                margin-bottom: 2px; }}
+  .chart {{ display: flex; gap: 7px; padding: 16px 14px 4px; align-items: flex-end; }}
   .col {{ flex: 1; min-width: 0; text-align: center; }}
   .barwrap {{ height: {bar_h}px; display: flex; align-items: flex-end;
-              background: #f8f9fa; border-radius: 8px; }}
+              background: rgba(120,120,128,.07); border-radius: 9px; }}
   .bar {{ width: 100%; display: flex; flex-direction: column-reverse; gap: 2px;
           padding: 2px; }}
-  .seg {{ border-radius: 3px; }}
-  .daylabel {{ display: inline-block; margin-top: 6px; font-size: 12px; color: var(--muted);
-               text-decoration: none; line-height: 1.3; }}
-  .daylabel.today {{ color: var(--accent); font-weight: 700; }}
-  .legend {{ display: flex; flex-wrap: wrap; gap: 5px; padding: 12px; }}
-  .chip {{ border-radius: 999px; padding: 3px 10px; font-size: 12.5px; font-weight: 600;
-           white-space: nowrap; border: 1px solid transparent; }}
-  table {{ width: calc(100% - 24px); margin: 4px 12px; border-collapse: collapse; font-size: 13.5px; }}
-  th, td {{ text-align: left; padding: 8px 6px; border-bottom: 1px solid var(--line); }}
-  th {{ color: var(--muted); font-size: 12px; font-weight: 600; }}
+  .seg {{ border-radius: 3.5px; }}
+  .daylabel {{ display: inline-block; margin-top: 7px; font-size: 12px; color: var(--muted);
+               text-decoration: none; line-height: 1.3; font-variant-numeric: tabular-nums; }}
+  .daylabel.today {{ color: var(--red); font-weight: 700; }}
+  .legend {{ display: flex; flex-wrap: wrap; gap: 5px; padding: 12px 14px 14px; }}
+  .chip {{ border-radius: 999px; padding: 3.5px 11px; font-size: 12px; font-weight: 600;
+           white-space: nowrap; }}
+  table {{ width: 100%; border-collapse: collapse; font-size: 14px; }}
+  .card table {{ margin: 0; }}
+  th, td {{ text-align: left; padding: 11px 16px; border-bottom: 0.5px solid var(--line); }}
+  tr:last-child td {{ border-bottom: none; }}
+  th {{ color: var(--muted); font-size: 12px; font-weight: 600; text-transform: uppercase;
+        letter-spacing: .03em; }}
   td:nth-child(n+2), th:nth-child(n+2) {{ text-align: right; font-variant-numeric: tabular-nums; }}
-  .dot {{ display: inline-block; width: 10px; height: 10px; border-radius: 3px;
-          margin-right: 7px; vertical-align: -1px; }}
+  .dot {{ display: inline-block; width: 11px; height: 11px; border-radius: 4px;
+          margin-right: 8px; vertical-align: -1px; }}
 </style>
 </head>
 <body>
@@ -1278,14 +1349,20 @@ def render_stats(end_date: str) -> str:
   <a class="nav" href="/stats?end={next_end}">▶</a>
   <a class="tl" href="/timeline">타임라인</a>
 </div>
-<div class="hero">킬링타임 <b>{kill_t}</b> · 기록 시간의 <b>{kill_pct}%</b>
-  <span style="color:var(--muted)"> (총 기록 {recorded // 60}시간 {recorded % 60}분)</span></div>
-<div class="chart">{"".join(cols)}</div>
-<div class="legend">{legend_html}</div>
+<div class="card hero">
+  <span class="big">킬링타임 {kill_t}</span>
+  기록 시간의 {kill_pct}% · 총 기록 {recorded // 60}시간 {recorded % 60}분
+</div>
+<div class="card">
+  <div class="chart">{"".join(cols)}</div>
+  <div class="legend">{legend_html}</div>
+</div>
+<div class="card">
 <table>
   <tr><th>카테고리</th><th>합계</th><th>일평균</th><th>비율</th></tr>
   {table_html}
 </table>
+</div>
 </body>
 </html>"""
 
