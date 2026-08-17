@@ -804,7 +804,7 @@ def render_timeline(start_date: str, days: int, show_hidden: bool) -> str:
         cov_pct = round(covered * 100 / elapsed) if elapsed else 100
         empty_chip = (
             f'<span class="chip emptychip" id="emptychip" data-covered="{covered}" '
-            f'data-ongoing="{1 if ongoing else 0}">'
+            f'data-ongoing="{1 if ongoing else 0}" style="--p:{cov_pct}%">'
             f"빈 시간 {_fmt_min(empty_min)} · 커버리지 {cov_pct}%</span>"
         )
 
@@ -894,8 +894,11 @@ def render_timeline(start_date: str, days: int, show_hidden: bool) -> str:
   .totals {{ padding: 8px 0; display: flex; flex-wrap: wrap; gap: 5px; }}
   .chip {{ border-radius: 999px; padding: 3.5px 11px; font-size: 12px; font-weight: 600;
            white-space: nowrap; border: none; letter-spacing: -0.01em; }}
-  .chip.emptychip {{ background: rgba(120,120,128,.16); color: #55555e;
-                     font-variant-numeric: tabular-nums; }}
+  /* 커버리지 프로그레스 캡슐: --p 위치까지 파란 틴트로 차오름 */
+  .chip.emptychip {{ background: linear-gradient(90deg,
+                       rgba(0,122,255,.28) var(--p, 0%), rgba(120,120,128,.14) var(--p, 0%));
+                     color: #3c3c43; font-variant-numeric: tabular-nums;
+                     box-shadow: inset 0 0 0 1px rgba(60,60,67,.08); }}
   .dayheads {{ display: flex; margin-left: 44px; }}
   .dayhead {{ flex: 1; min-width: 0; display: flex; flex-direction: column; align-items: center;
               gap: 1px; padding: 4px 0 6px; text-decoration: none; }}
@@ -1543,6 +1546,7 @@ def render_timeline(start_date: str, days: int, show_hidden: bool) -> str:
       var empty = Math.max(0, elapsed - covered);
       var pct = elapsed ? Math.round(covered * 100 / elapsed) : 100;
       ec.textContent = '빈 시간 ' + fmtMin(empty) + ' · 커버리지 ' + pct + '%';
+      ec.style.setProperty('--p', pct + '%');
     }}
     setInterval(upd, 60000);
   }})();
