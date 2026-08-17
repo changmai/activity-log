@@ -1340,7 +1340,10 @@ def render_timeline(start_date: str, days: int, show_hidden: bool) -> str:
 
   edittext.addEventListener('input', function () {{ dirty.text = true; }});
   edittext.addEventListener('keydown', function (e) {{
-    if (e.key === 'Enter') {{ e.preventDefault(); saveAll(); }}  // 엔터로 바로 저장
+    // 엔터로 바로 저장 (한글 IME 조합 확정 엔터는 무시 — 중복 저장 방지)
+    if (e.key !== 'Enter' || e.isComposing || e.keyCode === 229) return;
+    e.preventDefault();
+    saveAll();
   }});
   editcat.addEventListener('change', function () {{ dirty.cat = true; saveAll(); }});  // 선택 즉시 저장
 
@@ -1481,6 +1484,7 @@ def render_timeline(start_date: str, days: int, show_hidden: bool) -> str:
     var qi = document.getElementById('quickin');
     var qb = document.getElementById('quickbtn');
     function send() {{
+      if (qb.disabled) return;  // 이중 호출 방지
       var t = qi.value.trim();
       if (!t) return;
       qb.disabled = true;
@@ -1496,7 +1500,10 @@ def render_timeline(start_date: str, days: int, show_hidden: bool) -> str:
       }}).catch(function (e) {{ alert(e.message); qb.disabled = false; }});
     }}
     qi.addEventListener('keydown', function (e) {{
-      if (e.key === 'Enter') {{ e.preventDefault(); send(); }}
+      // 한글 IME 조합 중 엔터는 keydown이 2번 발생 (조합 확정 + 실제 입력) → 중복 전송 방지
+      if (e.key !== 'Enter' || e.isComposing || e.keyCode === 229) return;
+      e.preventDefault();
+      send();
     }});
     qb.addEventListener('click', send);
   }})();
