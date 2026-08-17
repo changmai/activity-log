@@ -5,6 +5,9 @@ import logging
 import os
 import re
 import sqlite3
+import subprocess
+import sys
+import threading
 from difflib import SequenceMatcher
 from datetime import datetime, timedelta
 from logging.handlers import RotatingFileHandler
@@ -98,6 +101,42 @@ def init_db() -> None:
 
 
 init_db()
+
+
+# ---- 즉시 분류: 기록 후 디바운스 시간 내 추가 기록이 없으면 classify.py 실행 ----
+# (연속 발화를 한 번의 claude CLI 호출로 묶음. 새벽 01:00 배치는 재시도 안전망으로 유지)
+CLASSIFY_DEBOUNCE_SEC = float(os.environ.get("CLASSIFY_DEBOUNCE_SEC", "90"))
+_classify_timer: Optional[threading.Timer] = None
+_classify_timer_lock = threading.Lock()
+_classify_run_lock = threading.Lock()  # 실행 직렬화 — claude CLI 동시 호출 방지
+
+
+def _run_classify() -> None:
+    with _classify_run_lock:
+        try:
+            proc = subprocess.run(
+                [sys.executable, str(ROOT / "scripts" / "classify.py")],
+                capture_output=True, text=True, timeout=700,
+            )
+            logger.info("instant classify done rc=%s", proc.returncode)
+        except Exception as e:  # 실패해도 서비스에 영향 없음 — 야간 배치가 재시도
+            logger.warning("instant classify failed: %s", e)
+
+
+def schedule_classify() -> None:
+    global _classify_timer
+    with _classify_timer_lock:
+        if _classify_timer is not None:
+            _classify_timer.cancel()
+        _classify_timer = threading.Timer(CLASSIFY_DEBOUNCE_SEC, _run_classify)
+        _classify_timer.daemon = True
+        _classify_timer.start()
+
+
+# 서버 시작 시 미분류가 남아 있으면 한 번 예약 (재시작으로 놓친 분류 보충)
+with get_db() as _c:
+    if _c.execute("SELECT 1 FROM events WHERE category IS NULL LIMIT 1").fetchone():
+        schedule_classify()
 
 
 def now_kst() -> datetime:
@@ -194,6 +233,7 @@ def post_log(body: LogIn, x_token: str = Header(default="")):
              "consumed" if matched_id is not None else None),
         )
     logger.info("log id=%s source=%s text=%s", cur.lastrowid, body.source, text)
+    schedule_classify()  # 디바운스 후 즉시 분류
     return {"ok": True, "id": cur.lastrowid, "ts": ts, "matched_end": matched_id}
 
 
@@ -323,6 +363,8 @@ def set_event_category(event_id: int, body: CategoryIn, x_requested_with: str = 
         else:
             conn.execute("UPDATE events SET category = ? WHERE id = ?", (body.category, event_id))
     logger.info("category id=%s -> %s", event_id, body.category)
+    if body.category is None:
+        schedule_classify()  # 리셋된 이벤트를 곧바로 재분류
     return {"ok": True, "category": body.category}
 
 
@@ -350,6 +392,7 @@ def set_event_text(event_id: int, body: TextIn, x_requested_with: str = Header(d
             (new_text, event_id),
         )
     logger.info("edit id=%s display_text=%s", event_id, new_text)
+    schedule_classify()  # 교정된 텍스트로 곧바로 재분류
     return {"ok": True, "display_text": new_text}
 
 
@@ -1102,13 +1145,16 @@ def render_timeline(start_date: str, days: int, show_hidden: bool) -> str:
   var WI = 36;                 // 휠 항목 높이(px)
   var startVal = '';           // 'HH:MM'
   var endVal = '';             // '' = 종료 미지정, 'HH:MM'
+  var endNextDay = false;      // 종료가 익일인지 (예: 수면 23:00 → 익일 07:00)
   var editTarget = 'end';      // 휠이 편집 중인 대상: 'start' | 'end'
   var cur = {{ h: 0, m: 0 }};
 
   function pad2(n) {{ return String(n).padStart(2, '0'); }}
+  function toMin(hhmm) {{
+    return parseInt(hhmm.slice(0, 2), 10) * 60 + parseInt(hhmm.slice(3, 5), 10);
+  }}
   function addMin(hhmm, delta) {{
-    var t = parseInt(hhmm.slice(0, 2), 10) * 60 + parseInt(hhmm.slice(3, 5), 10) + delta;
-    t = Math.max(0, Math.min(t, 23 * 60 + 59));
+    var t = Math.max(0, Math.min(toMin(hhmm) + delta, 23 * 60 + 59));
     return pad2(Math.floor(t / 60)) + ':' + pad2(t % 60);
   }}
   function setStartVal(v) {{
@@ -1117,13 +1163,20 @@ def render_timeline(start_date: str, days: int, show_hidden: bool) -> str:
   }}
   function setEndVal(v) {{
     endVal = v;
-    enddisp.textContent = v || '–';
+    if (!v) endNextDay = false;
+    enddisp.textContent = v ? ((endNextDay ? '익일 ' : '') + v) : '–';
   }}
   function positionWheels(v) {{
     cur.h = parseInt(v.slice(0, 2), 10);
     cur.m = parseInt(v.slice(3, 5), 10);
     wh.scrollTop = cur.h * WI;
     wm.scrollTop = cur.m * WI;
+  }}
+  function revertEnd() {{
+    // 잘못된 선택을 마지막 유효 값(없으면 시작+1분)으로 되돌림
+    var back = endVal || (startVal ? addMin(startVal, 1) : '00:00');
+    setEndVal(back);
+    positionWheels(back);
   }}
   function bindWheel(el, part) {{
     var t = null;
@@ -1137,24 +1190,44 @@ def render_timeline(start_date: str, days: int, show_hidden: bool) -> str:
         cand[part] = idx;
         var candVal = pad2(cand.h) + ':' + pad2(cand.m);
         if (editTarget === 'end') {{
-          if (startVal && candVal <= startVal) {{
-            // 시작 이전 시각은 허용하지 않음 — 알림 후 유효한 값으로 되돌림
-            alert('종료 시각은 시작(' + startVal + ') 이후여야 해요');
-            var back = (endVal && endVal > startVal) ? endVal : addMin(startVal, 1);
-            setEndVal(back);
-            positionWheels(back);
+          if (startVal && candVal === startVal) {{
+            alert('종료가 시작 시각과 같아요');
+            revertEnd();
             return;
           }}
+          var nd = !!(startVal && candVal < startVal);  // 시작 이전 시각 = 익일 종료로 해석
+          if (nd) {{
+            if (24 * 60 - toMin(startVal) + toMin(candVal) > 18 * 60) {{
+              alert('18시간을 넘는 활동은 저장할 수 없어요');
+              revertEnd();
+              return;
+            }}
+            if (!confirm('종료를 다음 날 ' + candVal + '(익일)로 저장할까요?')) {{
+              revertEnd();
+              return;
+            }}
+          }}
           cur[part] = idx;
+          endNextDay = nd;
           setEndVal(candVal);
           dirty.end = true;
         }} else {{
-          if (endVal && candVal >= endVal) {{
-            alert('시작 시각은 종료(' + endVal + ') 이전이어야 해요');
-            var back2 = (startVal && startVal < endVal) ? startVal : addMin(endVal, -1);
-            setStartVal(back2);
-            positionWheels(back2);
-            return;
+          if (endVal) {{
+            var bad = '';
+            if (endNextDay) {{
+              if (24 * 60 - toMin(candVal) + toMin(endVal) > 18 * 60) {{
+                bad = '18시간을 넘는 활동은 저장할 수 없어요';
+              }}
+            }} else if (candVal >= endVal) {{
+              bad = '시작 시각은 종료(' + endVal + ') 이전이어야 해요';
+            }}
+            if (bad) {{
+              alert(bad);
+              var back2 = startVal || addMin(endVal, -1);
+              setStartVal(back2);
+              positionWheels(back2);
+              return;
+            }}
           }}
           cur[part] = idx;
           setStartVal(candVal);
@@ -1209,6 +1282,8 @@ def render_timeline(start_date: str, days: int, show_hidden: bool) -> str:
     setStartVal(b.dataset.start || '');
     edittext.value = b.dataset.text || '';
     editcat.value = b.dataset.category || '';
+    // 저장된 종료가 시작보다 이른 HH:MM이면 익일 종료 (예: 23:00 → 07:00)
+    endNextDay = !!(b.dataset.end && b.dataset.start && b.dataset.end < b.dataset.start);
     setEndVal(b.dataset.end || '');
     wheelbox.hidden = true;
     document.getElementById('hidebtn').textContent = b.dataset.hidden === '1' ? '숨김 해제' : '숨김';
@@ -1265,7 +1340,7 @@ def render_timeline(start_date: str, days: int, show_hidden: bool) -> str:
     if (dirty.start) {{
       var sv = startVal;
       if (!sv) {{ alert('시작 시각이 비어 있어요'); return; }}
-      if (endVal && endVal <= sv) {{
+      if (endVal && !endNextDay && endVal <= sv) {{
         alert('시작 시각은 종료(' + endVal + ') 이전이어야 해요');
         return;
       }}
@@ -1274,7 +1349,11 @@ def render_timeline(start_date: str, days: int, show_hidden: bool) -> str:
     if (dirty.end) {{
       var v = endVal;
       if (v) {{
-        if (startVal && v <= startVal) {{
+        if (startVal && v === startVal) {{
+          alert('종료가 시작 시각과 같아요');
+          return;
+        }}
+        if (startVal && v < startVal && !endNextDay) {{
           alert('종료 시각은 시작(' + startVal + ') 이후여야 해요');
           return;
         }}
