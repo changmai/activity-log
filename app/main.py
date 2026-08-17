@@ -668,10 +668,8 @@ def render_timeline(start_date: str, days: int, show_hidden: bool) -> str:
     days_options = "".join(
         f'<option value="{n}"{" selected" if n == days else ""}>{n}일</option>' for n in range(1, 8)
     )
-    endh_options = '<option value="">–</option>' + "".join(
-        f'<option value="{h:02d}">{h:02d}</option>' for h in range(24)
-    )
-    endm_options = "".join(f'<option value="{m:02d}">{m:02d}</option>' for m in range(60))
+    wheel_h_items = "".join(f'<div class="wi">{h:02d}</div>' for h in range(24))
+    wheel_m_items = "".join(f'<div class="wi">{m:02d}</div>' for m in range(60))
     cat_options = "".join(f'<option value="{c}">{c}</option>' for c in CATEGORIES)
     hidden_toggle = (
         f'<a class="hlink" href="/timeline?date={start_date}&days={days}">숨김 닫기</a>'
@@ -811,14 +809,27 @@ def render_timeline(start_date: str, days: int, show_hidden: bool) -> str:
   #editstart {{ font-size: 16px; font-weight: 600; color: var(--text);
                 font-variant-numeric: tabular-nums; line-height: 1.3; }}
   .tarrow {{ color: var(--muted); font-size: 14px; padding-bottom: 2px; }}
-  /* 종료 시/분: 커스텀 select (네이티브 time input은 데스크톱 UI가 조악하고 iOS에서 빈 값 표시가 깨짐) */
-  .tsel {{ display: flex; align-items: center; }}
-  #endh, #endm {{ font-size: 16px; font-weight: 600; border: none; background: transparent;
-                  color: var(--accent); padding: 0 1px; cursor: pointer;
-                  -webkit-appearance: none; appearance: none;
-                  font-variant-numeric: tabular-nums; line-height: 1.3; text-align: center; }}
-  .colon {{ color: var(--accent); font-weight: 600; font-size: 16px; }}
-  .tsel.noend .colon, .tsel.noend #endm {{ display: none; }}
+  #endcell {{ cursor: pointer; }}
+  #enddisp {{ font-size: 16px; font-weight: 600; color: var(--accent);
+              font-variant-numeric: tabular-nums; line-height: 1.3; }}
+  /* iOS 시계 휠 피커: 스크롤 스냅 드럼 2개 + 중앙 하이라이트 밴드 */
+  #wheelbox {{ display: flex; flex-direction: column; gap: 4px; }}
+  #wheelbox[hidden] {{ display: none; }}
+  .wheels {{ position: relative; display: flex; justify-content: center; gap: 2px; height: 180px; }}
+  .wheelband {{ position: absolute; left: 22%; right: 22%; top: 72px; height: 36px;
+                border-radius: 9px; background: var(--fill); }}
+  .wheel {{ position: relative; z-index: 1; height: 180px; overflow-y: scroll; width: 66px;
+            scroll-snap-type: y mandatory; padding: 72px 0; text-align: center;
+            -webkit-overflow-scrolling: touch; scrollbar-width: none;
+            -webkit-mask-image: linear-gradient(transparent, #000 28%, #000 72%, transparent);
+            mask-image: linear-gradient(transparent, #000 28%, #000 72%, transparent); }}
+  .wheel::-webkit-scrollbar {{ display: none; }}
+  .wi {{ height: 36px; line-height: 36px; font-size: 21px; font-weight: 600;
+         color: var(--text); font-variant-numeric: tabular-nums; scroll-snap-align: center;
+         cursor: pointer; }}
+  .wcolon {{ z-index: 1; line-height: 176px; font-size: 20px; font-weight: 700; color: var(--text); }}
+  #editbar #noend {{ align-self: center; background: none; color: var(--muted);
+                     font-size: 13px; padding: 4px 12px; font-weight: 500; }}
   #editbar button {{ font-size: 14px; padding: 9px 13px; border: none; border-radius: 10px;
                      background: var(--fill); white-space: nowrap; cursor: pointer;
                      color: var(--accent); font-weight: 600; }}
@@ -858,18 +869,23 @@ def render_timeline(start_date: str, days: int, show_hidden: bool) -> str:
     <div id="timerange">
       <div class="tcell"><span class="tlabel">시작</span><span id="editstart">–</span></div>
       <div class="tarrow">→</div>
-      <div class="tcell"><span class="tlabel">종료</span>
-        <span class="tsel" id="tsel">
-          <select id="endh">{endh_options}</select>
-          <span class="colon">:</span>
-          <select id="endm">{endm_options}</select>
-        </span>
+      <div class="tcell" id="endcell"><span class="tlabel">종료</span>
+        <span id="enddisp">–</span>
       </div>
     </div>
     <select id="editcat">
       <option value="">자동 재분류(다음 배치)</option>
       {cat_options}
     </select>
+  </div>
+  <div id="wheelbox" hidden>
+    <div class="wheels">
+      <div class="wheelband"></div>
+      <div class="wheel" id="wh">{wheel_h_items}</div>
+      <div class="wcolon">:</div>
+      <div class="wheel" id="wm">{wheel_m_items}</div>
+    </div>
+    <button id="noend">종료 시각 없음</button>
   </div>
   <div class="ebrow">
     <button id="endsave">저장</button>
@@ -1016,19 +1032,65 @@ def render_timeline(start_date: str, days: int, show_hidden: bool) -> str:
   var dirty = {{ text: false, cat: false, end: false }};
   var edittext = document.getElementById('edittext');
   var editcat = document.getElementById('editcat');
-  var endh = document.getElementById('endh');
-  var endm = document.getElementById('endm');
-  var tsel = document.getElementById('tsel');
 
-  function syncTsel() {{ tsel.classList.toggle('noend', endh.value === ''); }}
+  // ---- iOS 스타일 시계 휠 피커 ----
+  var enddisp = document.getElementById('enddisp');
+  var wheelbox = document.getElementById('wheelbox');
+  var wh = document.getElementById('wh');
+  var wm = document.getElementById('wm');
+  var WI = 36;                 // 휠 항목 높이(px)
+  var endVal = '';             // '' = 종료 미지정, 'HH:MM'
+  var cur = {{ h: 0, m: 0 }};
+
+  function pad2(n) {{ return String(n).padStart(2, '0'); }}
+  function setEndVal(v) {{
+    endVal = v;
+    enddisp.textContent = v || '–';
+  }}
+  function positionWheels(v) {{
+    cur.h = parseInt(v.slice(0, 2), 10);
+    cur.m = parseInt(v.slice(3, 5), 10);
+    wh.scrollTop = cur.h * WI;
+    wm.scrollTop = cur.m * WI;
+  }}
+  function bindWheel(el, part) {{
+    var t = null;
+    el.addEventListener('scroll', function () {{
+      if (t) clearTimeout(t);
+      t = setTimeout(function () {{
+        var idx = Math.max(0, Math.min(Math.round(el.scrollTop / WI), el.children.length - 1));
+        if (cur[part] === idx && endVal) return;  // 위치 이동만으로는 변경 아님
+        cur[part] = idx;
+        setEndVal(pad2(cur.h) + ':' + pad2(cur.m));
+        dirty.end = true;
+      }}, 130);
+    }});
+    el.addEventListener('click', function (e) {{
+      var wi = e.target.closest ? e.target.closest('.wi') : null;
+      if (wi) el.scrollTo({{ top: Array.prototype.indexOf.call(el.children, wi) * WI,
+                             behavior: 'smooth' }});
+    }});
+  }}
+  bindWheel(wh, 'h');
+  bindWheel(wm, 'm');
+
+  document.getElementById('endcell').addEventListener('click', function () {{
+    if (!wheelbox.hidden) {{ wheelbox.hidden = true; return; }}
+    wheelbox.hidden = false;
+    // 미지정이면 현재 시각에서 시작 (휠이 정렬되며 값이 선택됨 — iOS와 동일)
+    positionWheels(endVal || new Date().toTimeString().slice(0, 5));
+  }});
+  document.getElementById('noend').addEventListener('click', function () {{
+    setEndVal('');
+    dirty.end = true;
+    wheelbox.hidden = true;
+  }});
 
   edittext.addEventListener('input', function () {{ dirty.text = true; }});
   edittext.addEventListener('keydown', function (e) {{
     if (e.key === 'Enter') {{ e.preventDefault(); saveAll(); }}  // 엔터로 바로 저장
   }});
   editcat.addEventListener('change', function () {{ dirty.cat = true; saveAll(); }});  // 선택 즉시 저장
-  endh.addEventListener('change', function () {{ dirty.end = true; syncTsel(); }});
-  endm.addEventListener('change', function () {{ dirty.end = true; }});
 
   function openEdit(b) {{
     selected = b;
@@ -1036,10 +1098,8 @@ def render_timeline(start_date: str, days: int, show_hidden: bool) -> str:
     document.getElementById('editstart').textContent = b.dataset.start || '–';
     edittext.value = b.dataset.text || '';
     editcat.value = b.dataset.category || '';
-    var end = b.dataset.end || '';
-    endh.value = end ? end.slice(0, 2) : '';
-    endm.value = end ? end.slice(3, 5) : '00';
-    syncTsel();
+    setEndVal(b.dataset.end || '');
+    wheelbox.hidden = true;
     document.getElementById('hidebtn').textContent = b.dataset.hidden === '1' ? '숨김 해제' : '숨김';
     editbar.hidden = false;
     document.body.style.paddingBottom = '140px';
@@ -1092,7 +1152,7 @@ def render_timeline(start_date: str, days: int, show_hidden: bool) -> str:
       seq = seq.then(function () {{ return api('/events/' + id + '/category', {{ category: c || null }}); }});
     }}
     if (dirty.end) {{
-      var v = endh.value === '' ? '' : endh.value + ':' + endm.value;
+      var v = endVal;
       if (v) {{
         var st = selected.dataset.start || '';
         if (st && v <= st && !confirm('익일 ' + v + ' 종료로 저장할까요?')) return;
