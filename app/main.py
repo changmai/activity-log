@@ -149,14 +149,50 @@ def now_kst() -> datetime:
     return datetime.now(KST)
 
 
+# 마커 = "<활동> 끝/종료/end [시각]". 시각 접미("6시 25분", "06:25")가 붙으면
+# 그 시각을 실제 종료로 사용 (예: 06:49 발화 "수면 끝 6시 25분" → 종료 06:25)
+_MARKER_RE = re.compile(
+    r"^(?P<base>.*?)(?:끝|종료|(?:(?<=\s)|^)end)"
+    r"(?:\s*(?:(?P<h1>\d{1,2})\s*시(?:\s*(?P<m1>\d{1,2})\s*분?)?|(?P<h2>\d{1,2})\s*:\s*(?P<m2>\d{2})))?"
+    r"\s*[.!?]?\s*$",
+    re.IGNORECASE,
+)
+
+
+def _parse_marker(text: str):
+    """마커면 (활동명, 시, 분) 반환 — 시각 접미 없으면 (활동명, None, None). 마커 아니면 None."""
+    m = _MARKER_RE.match(text.strip())
+    if not m:
+        return None
+    h = m.group("h1") or m.group("h2")
+    mnt = m.group("m1") or m.group("m2")
+    hh = int(h) if h is not None else None
+    mm = int(mnt) if mnt is not None else (0 if hh is not None else None)
+    if hh is not None and (hh > 23 or (mm or 0) > 59):
+        return m.group("base").strip(), None, None  # 시각으로 볼 수 없는 숫자 — 무시
+    return m.group("base").strip(), hh, mm
+
+
 def is_end_marker(text: str) -> bool:
-    """종료 마커 판정: '끝'/'종료'/'end' 단독 또는 그 단어로 끝나는 문장.
-    예: "빨래 끝" → 해당 시각부터 빈 시간. 판정은 항상 raw_text 기준."""
-    t = text.strip().lower()
-    return t in END_MARKERS or t.endswith(("끝", "종료", " end"))
+    """종료 마커 판정: '끝'/'종료'/'end'(+선택적 시각)로 끝나는 문장.
+    예: "빨래 끝", "수면 끝 6시 25분" → 해당 시각부터 빈 시간. 판정은 항상 raw_text 기준."""
+    return text.strip().lower() in END_MARKERS or _parse_marker(text) is not None
 
 
-_MARKER_SUFFIX_RE = re.compile(r"^(.*?)(?:끝|종료|end)\s*$", re.IGNORECASE)
+def _resolve_marker_time(hh: int, mm: int, marker_ts: datetime) -> Optional[datetime]:
+    """마커에 붙은 시각을 실제 시점으로 해석: 발화 시각 이전의 가장 가까운 해당 시각.
+    12시간 표기 보정 포함 (예: 00:10 발화 "…끝 11시 50분" → 전날 23:50)."""
+    cands = []
+    hours = {hh, hh + 12} if hh <= 11 else {hh}
+    for day_off in (0, -1):
+        for h in hours:
+            if h > 23:
+                continue
+            c = (marker_ts + timedelta(days=day_off)).replace(
+                hour=h, minute=mm, second=0, microsecond=0)
+            if c <= marker_ts:
+                cands.append(c)
+    return max(cands) if cands else None
 
 
 def _normalize_text(t: str) -> str:
@@ -171,10 +207,14 @@ def match_marker_to_activity(text: str, marker_ts: datetime) -> Optional[int]:
     병렬 활동 지원: 직전 1건이 아니라 최근 24h 내 열린 활동들을 최신순으로 거슬러
     올라가며 텍스트가 맞는 첫 활동을 닫는다 (예: 설거지 → 밥 먹기 → "설거지 끝").
     """
-    m = _MARKER_SUFFIX_RE.match(text.strip())
-    base = m.group(1).strip() if m else ""
-    if not base:
+    parsed = _parse_marker(text)
+    if parsed is None or not parsed[0]:
         return None  # 단독 "끝" — 매칭 대상 없음
+    base, hh, mm = parsed
+    # 시각 접미가 있으면 그 시각이 종료 (발화 시각 이전으로 해석), 없으면 발화 시각
+    end_dt = _resolve_marker_time(hh, mm, marker_ts) if hh is not None else marker_ts
+    if end_dt is None:
+        end_dt = marker_ts
     with get_db() as conn:
         candidates = conn.execute(
             "SELECT * FROM events WHERE COALESCE(effective_ts, ts) < ? "
@@ -190,17 +230,17 @@ def match_marker_to_activity(text: str, marker_ts: datetime) -> Optional[int]:
             if is_end_marker(prev["raw_text"]) or prev["end_ts"] or prev["hidden"]:
                 continue
             prev_start = parse_ts(prev["effective_ts"] or prev["ts"])
-            if prev_start is None or not (prev_start < marker_ts <= prev_start + timedelta(hours=24)):
+            if prev_start is None or not (prev_start < end_dt <= prev_start + timedelta(hours=24)):
                 continue
             b = _normalize_text(prev["display_text"] or prev["raw_text"])
             if not (a == b or a in b or b in a or SequenceMatcher(None, a, b).ratio() >= 0.75):
                 continue
             conn.execute(
                 "UPDATE events SET end_ts = ? WHERE id = ?",
-                (marker_ts.isoformat(timespec="seconds"), prev["id"]),
+                (end_dt.isoformat(timespec="seconds"), prev["id"]),
             )
             logger.info("marker match: '%s' → id=%s end_ts=%s", base, prev["id"],
-                        marker_ts.isoformat(timespec="seconds"))
+                        end_dt.isoformat(timespec="seconds"))
             return prev["id"]
         return None
 
