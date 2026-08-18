@@ -106,15 +106,18 @@ def get_replies(last_update_id: int) -> tuple[list[str], int]:
     return replies, new_last
 
 
-def fetch_day(date: str) -> list[dict]:
+def fetch_days(dates: list[str]) -> list[dict]:
+    """대상 날짜(들)의 기록. 어제도 포함해 — 자정 넘김 정리와
+    '어제 자동 정리에 대한 지적 답장'을 반영할 수 있게 한다."""
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
+    marks = ",".join("?" * len(dates))
     rows = conn.execute(
         "SELECT id, ts, COALESCE(effective_ts, ts) AS start, effective_ts, end_ts, "
         "raw_text, display_text, category, source, hidden, note FROM events "
-        "WHERE substr(COALESCE(effective_ts, ts), 1, 10) = ? "
+        f"WHERE substr(COALESCE(effective_ts, ts), 1, 10) IN ({marks}) "
         "ORDER BY COALESCE(effective_ts, ts), id",
-        (date,),
+        dates,
     ).fetchall()
     conn.close()
     return [dict(r) for r in rows]
@@ -167,9 +170,29 @@ def validate_item(item: dict, rows_by_id: dict, ongoing_id) -> str | None:
     return None
 
 
-def apply_plan(items: list[dict], rows_by_id: dict, run_id: str, dry: bool) -> tuple[int, list[str]]:
+def _fmt_change(row: dict, fields: dict) -> str:
+    """적용 내역을 사용자에게 보여줄 한 줄로."""
+    name = (row["display_text"] or row["raw_text"])[:24]
+    parts = []
+    if "display_text" in fields:
+        parts.append(f"표시 '{fields['display_text']}'" if fields["display_text"] else "표시 복원")
+    if "effective_ts" in fields:
+        parts.append(f"시작 {fields['effective_ts'][11:16]}" if fields["effective_ts"] else "시작 해제")
+    if "end_ts" in fields:
+        parts.append(f"종료 {fields['end_ts'][11:16]}" if fields["end_ts"] else "종료 해제")
+    if "category" in fields:
+        parts.append(f"분류 {fields['category']}")
+    if fields.get("note") == "merged":
+        parts.append("중복 병합")
+    if fields.get("note") == "consumed":
+        parts.append("종료 보고로 처리")
+    return f"{name} → " + ", ".join(parts)
+
+
+def apply_plan(items: list[dict], rows_by_id: dict, run_id: str, dry: bool
+               ) -> tuple[int, list[str], list[str]]:
     conn = sqlite3.connect(DB_PATH)
-    applied, rejected = 0, []
+    applied, rejected, summaries = 0, [], []
     # '진행 중' = 종료가 없고, DB 전체에서 그보다 뒤에 아무 기록도 없으며, 시작 24h 이내
     starts = {i: parse_ts(r["start"]) for i, r in rows_by_id.items()}
     open_rows = [i for i, r in rows_by_id.items() if not r["end_ts"] and not (r["note"] or "")]
@@ -200,10 +223,11 @@ def apply_plan(items: list[dict], rows_by_id: dict, run_id: str, dry: bool) -> t
                     {"run": run_id, "at": datetime.now(KST).isoformat(timespec="seconds"),
                      "id": eid, "before": before, "after": fields}, ensure_ascii=False) + "\n")
             applied += 1
+            summaries.append(_fmt_change(rows_by_id[eid], fields))
             logger.info("%s id=%s %s -> %s", "적용" if not dry else "(dry)", eid, before, fields)
     conn.commit()
     conn.close()
-    return applied, rejected
+    return applied, rejected, summaries
 
 
 def rollback(run_id: str) -> int:
@@ -236,8 +260,9 @@ def main() -> int:
 
     now = datetime.now(KST)
     date = args.date or now.strftime("%Y-%m-%d")
+    prev_date = (datetime.strptime(date, "%Y-%m-%d") - timedelta(days=1)).strftime("%Y-%m-%d")
     run_id = now.strftime("%Y%m%d-%H%M%S")
-    rows = fetch_day(date)
+    rows = fetch_days([prev_date, date])
     if not rows:
         logger.info("%s 기록 없음 — 종료", date)
         return 0
@@ -254,9 +279,12 @@ def main() -> int:
     sections = [
         PROMPT_PATH.read_text(encoding="utf-8"),
         "\n## 규칙집\n" + (RULES_PATH.read_text(encoding="utf-8") if RULES_PATH.exists() else "(비어 있음)"),
-        f"\n## 현재 시각\n{now.isoformat(timespec='seconds')} (대상 날짜: {date})",
-        "\n## 오늘의 기록\n" + events_json,
+        f"\n## 현재 시각\n{now.isoformat(timespec='seconds')} (대상 날짜: {date}, 전날 {prev_date} 기록도 수정 가능)",
+        "\n## 기록 (전날 + 대상 날짜)\n" + events_json,
     ]
+    if state.get("last_applied"):
+        sections.append("\n## 직전 실행에서 자동 적용된 정리 내역 (사용자 답장이 이를 지적할 수 있음)\n"
+                        + "\n".join(f"{i+1}. {s}" for i, s in enumerate(state["last_applied"])))
     if pending:
         sections.append("\n## 이전 실행에서 보낸 질문 (미해결)\n"
                         + "\n".join(f"{i+1}. {q['question']} (관련 id: {q['ids']})"
@@ -282,7 +310,7 @@ def main() -> int:
         logger.error("응답 파싱 실패: %s", e)
         return 1
 
-    applied, rejected = apply_plan(plan.get("apply") or [], rows_by_id, run_id, args.dry_run)
+    applied, rejected, summaries = apply_plan(plan.get("apply") or [], rows_by_id, run_id, args.dry_run)
     for why in rejected:
         logger.warning("거부: %s", why)
 
@@ -294,20 +322,27 @@ def main() -> int:
         logger.info("규칙 %d개 학습: %s", len(new_rules), new_rules)
 
     asks = [a for a in (plan.get("ask") or []) if isinstance(a, dict) and a.get("question")]
-    if asks and not args.dry_run:
-        text = "🧹 기록 정리 질문 (" + date + ")\n" + "\n".join(
-            f"{i+1}. {a['question']}" for i, a in enumerate(asks)
-        ) + "\n\n답장으로 알려주시면 다음 정리 때 반영·학습됩니다."
+    # 정리 보고: 자동 적용 내역은 항상 알려서 사용자가 검증할 수 있게 한다.
+    # 질문이 없으면 무음 알림 (열어보고 잘못된 게 있으면 답장으로 지적 → 다음 실행이 교정·학습)
+    if (summaries or asks) and not args.dry_run:
+        parts = [f"🧹 기록 정리 ({date} {now.strftime('%H:%M')})"]
+        if summaries:
+            parts.append("자동 정리:\n" + "\n".join(f"{i+1}. {s}" for i, s in enumerate(summaries)))
+        if asks:
+            parts.append("질문:\n" + "\n".join(f"{i+1}. {a['question']}" for i, a in enumerate(asks)))
+        parts.append("잘못된 정리 지적이나 질문 답변은 답장으로 — 다음 정리 때 반영·학습됩니다.")
         try:
             tg("sendMessage", {"chat_id": os.environ.get("TELEGRAM_CHAT_ID"),
-                               "text": text, "disable_web_page_preview": True})
+                               "text": "\n\n".join(parts), "disable_web_page_preview": True,
+                               "disable_notification": not asks})
         except Exception as e:
-            logger.warning("질문 전송 실패: %s", e)
+            logger.warning("정리 보고 전송 실패: %s", e)
 
     if not args.dry_run:
         STATE_PATH.write_text(json.dumps(
             {"last_update_id": new_last,
-             "pending": [{"question": a["question"], "ids": a.get("ids", [])} for a in asks]},
+             "pending": [{"question": a["question"], "ids": a.get("ids", [])} for a in asks],
+             "last_applied": summaries},
             ensure_ascii=False, indent=1), encoding="utf-8")
 
     logger.info("run=%s 적용 %d건, 거부 %d건, 질문 %d건, 새 규칙 %d개 (cost=$%.4f)%s",
