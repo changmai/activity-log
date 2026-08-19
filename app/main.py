@@ -988,6 +988,12 @@ def render_timeline(start_date: str, days: int, show_hidden: bool) -> str:
          white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }}
   html.pinching .bt {{ transform: scaleY(var(--isy, 1)); }}
   .nowline {{ position: absolute; left: 0; right: 0; height: 0; border-top: 2px solid var(--red); z-index: 2; }}
+  /* PWA(standalone)에서는 alert/confirm이 표시되지 않으므로 토스트로 안내 */
+  #toast {{ position: fixed; top: 64px; left: 50%; transform: translateX(-50%); z-index: 50;
+            background: rgba(28,28,30,.92); color: #fff; padding: 8px 14px; border-radius: 10px;
+            font-size: 13px; font-weight: 600; opacity: 0; pointer-events: none;
+            transition: opacity .2s; max-width: 88%; text-align: center; }}
+  #toast.show {{ opacity: 1; }}
   .nowline::before {{ content: ""; position: absolute; left: -4px; top: -5px; width: 8px; height: 8px;
                       border-radius: 50%; background: var(--red); }}
   /* iOS 시트 스타일 편집 패널 */
@@ -1080,6 +1086,7 @@ def render_timeline(start_date: str, days: int, show_hidden: bool) -> str:
   <div class="axis">{hours_html}</div>
   <div class="daycols">{columns_html}</div>
 </div>
+<div id="toast"></div>
 <div id="editbar" hidden>
   <div class="ebrow">
     <input type="text" id="edittext" placeholder="텍스트 수정">
@@ -1245,6 +1252,16 @@ def render_timeline(start_date: str, days: int, show_hidden: bool) -> str:
     }});
   }});
 
+  // 대화상자(alert/confirm)는 iOS PWA standalone에서 표시되지 않음 — 토스트로 대체
+  var toastEl = document.getElementById('toast');
+  var toastT = null;
+  function toast(msg) {{
+    toastEl.textContent = msg;
+    toastEl.classList.add('show');
+    if (toastT) clearTimeout(toastT);
+    toastT = setTimeout(function () {{ toastEl.classList.remove('show'); }}, 2400);
+  }}
+
   // ---------- 편집 패널 ----------
   var editbar = document.getElementById('editbar');
   var selected = null;
@@ -1308,21 +1325,19 @@ def render_timeline(start_date: str, days: int, show_hidden: bool) -> str:
         var candVal = pad2(cand.h) + ':' + pad2(cand.m);
         if (editTarget === 'end') {{
           if (startVal && candVal === startVal) {{
-            alert('종료가 시작 시각과 같아요');
+            toast('종료가 시작 시각과 같아요');
             revertEnd();
             return;
           }}
           var nd = !!(startVal && candVal < startVal);  // 시작 이전 시각 = 익일 종료로 해석
           if (nd) {{
             if (24 * 60 - toMin(startVal) + toMin(candVal) > 18 * 60) {{
-              alert('18시간을 넘는 활동은 저장할 수 없어요');
+              toast('18시간을 넘는 활동은 저장할 수 없어요');
               revertEnd();
               return;
             }}
-            if (!confirm('종료를 다음 날 ' + candVal + '(익일)로 저장할까요?')) {{
-              revertEnd();
-              return;
-            }}
+            // 같은 날 더 이른 종료는 있을 수 없으므로 확인 없이 익일로 해석
+            toast('다음 날 ' + candVal + ' 종료로 설정됩니다');
           }}
           cur[part] = idx;
           endNextDay = nd;
@@ -1339,7 +1354,7 @@ def render_timeline(start_date: str, days: int, show_hidden: bool) -> str:
               bad = '시작 시각은 종료(' + endVal + ') 이전이어야 해요';
             }}
             if (bad) {{
-              alert(bad);
+              toast(bad);
               var back2 = startVal || addMin(endVal, -1);
               setStartVal(back2);
               positionWheels(back2);
@@ -1407,6 +1422,7 @@ def render_timeline(start_date: str, days: int, show_hidden: bool) -> str:
     setEndVal(b.dataset.end || '');
     wheelbox.hidden = true;
     document.getElementById('hidebtn').textContent = b.dataset.hidden === '1' ? '숨김 해제' : '숨김';
+    hideArmedAt = 0;  // 이전 블록에서 누른 숨김 1단계가 이월되지 않게
     editbar.hidden = false;
     document.body.style.paddingBottom = '140px';
   }}
@@ -1459,9 +1475,9 @@ def render_timeline(start_date: str, days: int, show_hidden: bool) -> str:
     }}
     if (dirty.start) {{
       var sv = startVal;
-      if (!sv) {{ alert('시작 시각이 비어 있어요'); return; }}
+      if (!sv) {{ toast('시작 시각이 비어 있어요'); return; }}
       if (endVal && !endNextDay && endVal <= sv) {{
-        alert('시작 시각은 종료(' + endVal + ') 이전이어야 해요');
+        toast('시작 시각은 종료(' + endVal + ') 이전이어야 해요');
         return;
       }}
       seq = seq.then(function () {{ return api('/events/' + id + '/start', {{ start: sv }}); }});
@@ -1470,11 +1486,11 @@ def render_timeline(start_date: str, days: int, show_hidden: bool) -> str:
       var v = endVal;
       if (v) {{
         if (startVal && v === startVal) {{
-          alert('종료가 시작 시각과 같아요');
+          toast('종료가 시작 시각과 같아요');
           return;
         }}
         if (startVal && v < startVal && !endNextDay) {{
-          alert('종료 시각은 시작(' + startVal + ') 이후여야 해요');
+          toast('종료 시각은 시작(' + startVal + ') 이후여야 해요');
           return;
         }}
         seq = seq.then(function () {{ return api('/events/' + id + '/end', {{ end: v }}); }});
@@ -1484,19 +1500,25 @@ def render_timeline(start_date: str, days: int, show_hidden: bool) -> str:
     }}
     if (!dirty.text && !dirty.cat && !dirty.end && !dirty.start) {{ closeEdit(); return; }}
     seq.then(function () {{ location.reload(); }})
-       .catch(function (e) {{ alert(e.message); }});
+       .catch(function (e) {{ toast(e.message); }});
   }}
   document.getElementById('endsave').addEventListener('click', saveAll);
 
-  document.getElementById('hidebtn').addEventListener('click', function () {{
+  // confirm() 대신 두 번 탭 확인 (PWA에서 대화상자가 표시되지 않으므로)
+  var hideArmedAt = 0;
+  var hidebtnEl = document.getElementById('hidebtn');
+  hidebtnEl.addEventListener('click', function () {{
     if (!selected) return;
     var hiding = selected.dataset.hidden !== '1';
-    var msg = hiding ? '이 기록을 숨길까요? 타임라인·통계에서 제외됩니다.\\n(숨김 보기에서 되돌릴 수 있어요)'
-                     : '숨김을 해제할까요?';
-    if (!confirm(msg)) return;
+    if (Date.now() - hideArmedAt > 3000) {{
+      hideArmedAt = Date.now();
+      hidebtnEl.textContent = hiding ? '한 번 더 누르면 숨김' : '한 번 더 누르면 해제';
+      toast(hiding ? '타임라인·통계에서 제외됩니다 (숨김 보기에서 복구 가능)' : '숨김을 해제합니다');
+      return;
+    }}
     api('/events/' + selected.dataset.id + '/hide', {{ hidden: hiding }})
       .then(function () {{ location.reload(); }})
-      .catch(function (e) {{ alert(e.message); }});
+      .catch(function (e) {{ toast(e.message); }});
   }});
 
   document.getElementById('closebtn').addEventListener('click', closeEdit);
@@ -1546,7 +1568,7 @@ def render_timeline(start_date: str, days: int, show_hidden: bool) -> str:
         var ds = todayStr();
         if (document.querySelector('.canvas[data-date="' + ds + '"]')) location.reload();
         else location.href = '/timeline?date=' + ds + '&days=' + DAYS + HQ;
-      }}).catch(function (e) {{ alert(e.message); qb.disabled = false; }});
+      }}).catch(function (e) {{ toast(e.message); qb.disabled = false; }});
     }}
     qi.addEventListener('keydown', function (e) {{
       // 한글 IME 조합 중 엔터는 keydown이 2번 발생 (조합 확정 + 실제 입력) → 중복 전송 방지
