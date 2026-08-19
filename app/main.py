@@ -868,7 +868,9 @@ def render_timeline(start_date: str, days: int, show_hidden: bool) -> str:
     days_options = "".join(
         f'<option value="{n}"{" selected" if n == days else ""}>{n}일</option>' for n in range(1, 8)
     )
-    wheel_h_items = "".join(f'<div class="wi">{h:02d}</div>' for h in range(24))
+    # 시간 휠: 당일 00~23 뒤에 익일 +00~+17 (18h 상한 내에서 자정 넘김 종료 선택용)
+    wheel_h_items = ("".join(f'<div class="wi">{h:02d}</div>' for h in range(24))
+                     + "".join(f'<div class="wi wnd">+{h:02d}</div>' for h in range(18)))
     wheel_m_items = "".join(f'<div class="wi">{m:02d}</div>' for m in range(60))
     cat_options = "".join(f'<option value="{c}">{c}</option>' for c in CATEGORIES)
     hidden_toggle = (
@@ -1048,6 +1050,7 @@ def render_timeline(start_date: str, days: int, show_hidden: bool) -> str:
   .wi {{ height: 36px; line-height: 36px; font-size: 21px; font-weight: 600;
          color: var(--text); font-variant-numeric: tabular-nums; scroll-snap-align: center;
          cursor: pointer; }}
+  .wi.wnd {{ color: var(--accent); }}  /* 익일(+HH) 시간대 구분 */
   .wcolon {{ z-index: 1; line-height: 176px; font-size: 20px; font-weight: 700; color: var(--text); }}
   #editbar #noend {{ align-self: center; background: none; color: var(--muted);
                      font-size: 13px; padding: 4px 12px; font-weight: 500; }}
@@ -1300,17 +1303,20 @@ def render_timeline(start_date: str, days: int, show_hidden: bool) -> str:
     if (!v) endNextDay = false;
     enddisp.textContent = v ? ((endNextDay ? '익일 ' : '') + v) : '–';
   }}
-  function positionWheels(v) {{
-    cur.h = parseInt(v.slice(0, 2), 10);
+  function positionWheels(v, nextday) {{
+    // 시간 휠 인덱스: 0~23 당일, 24~41 익일(+00~+17)
+    cur.h = parseInt(v.slice(0, 2), 10) + (nextday ? 24 : 0);
     cur.m = parseInt(v.slice(3, 5), 10);
     wh.scrollTop = cur.h * WI;
     wm.scrollTop = cur.m * WI;
   }}
   function revertEnd() {{
     // 잘못된 선택을 마지막 유효 값(없으면 시작+1분)으로 되돌림
+    var backNd = endVal ? endNextDay : false;
     var back = endVal || (startVal ? addMin(startVal, 1) : '00:00');
+    endNextDay = backNd;
     setEndVal(back);
-    positionWheels(back);
+    positionWheels(back, backNd);
   }}
   function bindWheel(el, part) {{
     var t = null;
@@ -1322,28 +1328,33 @@ def render_timeline(start_date: str, days: int, show_hidden: bool) -> str:
         if (cur[part] === idx && curVal) return;  // 위치 이동만으로는 변경 아님
         var cand = {{ h: cur.h, m: cur.m }};
         cand[part] = idx;
-        var candVal = pad2(cand.h) + ':' + pad2(cand.m);
+        var candNd = cand.h >= 24;                       // +HH 구간 = 익일
+        var candVal = pad2(cand.h % 24) + ':' + pad2(cand.m);
         if (editTarget === 'end') {{
-          if (startVal && candVal === startVal) {{
-            toast('종료가 시작 시각과 같아요');
-            revertEnd();
-            return;
-          }}
-          var nd = !!(startVal && candVal < startVal);  // 시작 이전 시각 = 익일 종료로 해석
-          if (nd) {{
-            if (24 * 60 - toMin(startVal) + toMin(candVal) > 18 * 60) {{
+          if (candNd) {{
+            if (!startVal || 24 * 60 - toMin(startVal) + toMin(candVal) > 18 * 60) {{
               toast('18시간을 넘는 활동은 저장할 수 없어요');
               revertEnd();
               return;
             }}
-            // 같은 날 더 이른 종료는 있을 수 없으므로 확인 없이 익일로 해석
-            toast('다음 날 ' + candVal + ' 종료로 설정됩니다');
+          }} else if (startVal && candVal <= startVal) {{
+            // 당일 구간에서 시작 이전 시각은 불가 — 익일 종료는 23 아래 +시간대로
+            toast('종료 시각은 시작(' + startVal + ') 이후여야 해요 · 다음 날 종료는 +시간대 선택');
+            revertEnd();
+            return;
           }}
           cur[part] = idx;
-          endNextDay = nd;
+          endNextDay = candNd;
           setEndVal(candVal);
           dirty.end = true;
         }} else {{
+          if (candNd) {{
+            toast('시작 시각은 당일만 선택할 수 있어요');
+            var backS = startVal || '00:00';
+            setStartVal(backS);
+            positionWheels(backS, false);
+            return;
+          }}
           if (endVal) {{
             var bad = '';
             if (endNextDay) {{
@@ -1357,7 +1368,7 @@ def render_timeline(start_date: str, days: int, show_hidden: bool) -> str:
               toast(bad);
               var back2 = startVal || addMin(endVal, -1);
               setStartVal(back2);
-              positionWheels(back2);
+              positionWheels(back2, false);
               return;
             }}
           }}
@@ -1381,10 +1392,11 @@ def render_timeline(start_date: str, days: int, show_hidden: bool) -> str:
     editTarget = target;
     noendBtn.hidden = target !== 'end';  // '종료 시각 없음'은 종료 편집일 때만
     wheelbox.hidden = false;
-    var init;
+    var init, initNd = false;
     if (target === 'end') {{
       // 미지정이면 현재 시각(단, 시작 이전이면 시작+1분)에서 시작 — 휠 정렬되며 값 선택 (iOS와 동일)
       init = endVal;
+      initNd = !!endVal && endNextDay;
       if (!init) {{
         var nowStr = new Date().toTimeString().slice(0, 5);
         init = (startVal && nowStr <= startVal) ? addMin(startVal, 1) : nowStr;
@@ -1392,7 +1404,7 @@ def render_timeline(start_date: str, days: int, show_hidden: bool) -> str:
     }} else {{
       init = startVal || new Date().toTimeString().slice(0, 5);
     }}
-    positionWheels(init);
+    positionWheels(init, initNd);
   }}
   document.getElementById('endcell').addEventListener('click', function () {{ openWheel('end'); }});
   document.getElementById('startcell').addEventListener('click', function () {{ openWheel('start'); }});
