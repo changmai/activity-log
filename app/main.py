@@ -838,26 +838,51 @@ def render_timeline(start_date: str, days: int, show_hidden: bool) -> str:
         _chip(k, v) for k, v in sorted(totals.items(), key=lambda kv: -kv[1])
     ) or _chip("기록 없음", None)
 
-    # 오늘이 보이면 00:00~현재의 빈 시간을 실시간 칩으로 표시 (JS가 1분마다 갱신)
+    # 날짜별 커버리지: 오늘은 경과 시간 기준, 과거는 24h 기준, 미래는 없음
+    now = now_kst()
+    elapsed_today = int((now - now.replace(hour=0, minute=0, second=0, microsecond=0))
+                        .total_seconds() // 60)
+    day_cov: dict[str, Optional[int]] = {}
+    for d in dates:
+        if d > today:
+            day_cov[d] = None
+        elif d == today:
+            cov = min(union_minutes(per_day[d], clip_end=now), elapsed_today)
+            day_cov[d] = round(cov * 100 / elapsed_today) if elapsed_today else 100
+        else:
+            day_cov[d] = round(min(union_minutes(per_day[d]), TOTAL_MIN) * 100 / TOTAL_MIN)
+
+    # 상단 캡슐: 오늘이 보이면 실시간(JS 1분 갱신), 과거 단일 날짜면 그 날의 확정값
     empty_chip = ""
     if today in per_day:
-        now = now_kst()
-        elapsed = int((now - now.replace(hour=0, minute=0, second=0, microsecond=0))
-                      .total_seconds() // 60)
-        covered = min(union_minutes(per_day[today], clip_end=now), elapsed)
-        empty_min = max(0, elapsed - covered)
+        covered = min(union_minutes(per_day[today], clip_end=now), elapsed_today)
+        empty_min = max(0, elapsed_today - covered)
         ongoing = any(b["ongoing"] for b in per_day[today])
-        cov_pct = round(covered * 100 / elapsed) if elapsed else 100
+        cov_pct = round(covered * 100 / elapsed_today) if elapsed_today else 100
         empty_chip = (
-            f'<span class="chip emptychip" id="emptychip" data-covered="{covered}" '
+            f'<span class="chip emptychip" id="emptychip" data-live="1" data-covered="{covered}" '
             f'data-ongoing="{1 if ongoing else 0}" style="--p:{cov_pct}%">'
             f"빈 시간 {_fmt_min(empty_min)} · 커버리지 {cov_pct}%</span>"
         )
+    elif days == 1 and dates[0] < today:
+        cov = min(union_minutes(per_day[dates[0]]), TOTAL_MIN)
+        pct = round(cov * 100 / TOTAL_MIN)
+        empty_chip = (
+            f'<span class="chip emptychip" style="--p:{pct}%">'
+            f"빈 시간 {_fmt_min(TOTAL_MIN - cov)} · 커버리지 {pct}%</span>"
+        )
+
+    def _covbar(d: str) -> str:
+        pct = day_cov[d]
+        if pct is None:
+            return '<span class="covbar"></span>'
+        return (f'<span class="covbar" title="커버리지 {pct}%">'
+                f'<span class="covfill" style="width:{pct}%"></span></span>')
 
     dayheads_html = "".join(
         f'<a class="dayhead{" today" if d == today else ""}" href="/timeline?date={d}&days=1{hq}">'
         f'<span class="wd">{WEEKDAYS[datetime.strptime(d, "%Y-%m-%d").weekday()]}</span>'
-        f'<span class="dn">{int(d[8:10])}</span></a>'
+        f'<span class="dn">{int(d[8:10])}</span>{_covbar(d)}</a>'
         for d in dates
     )
     columns_html = "".join(render_day_column(d, per_day[d], show_hidden) for d in dates)
@@ -957,6 +982,10 @@ def render_timeline(start_date: str, days: int, show_hidden: bool) -> str:
                   border-radius: 50%; font-variant-numeric: tabular-nums; }}
   .dayhead.today .wd {{ color: var(--red); }}
   .dayhead.today .dn {{ background: var(--red); color: #fff; font-weight: 700; }}
+  /* 날짜별 커버리지 미니 바 */
+  .covbar {{ width: 30px; height: 4px; margin-top: 2px; border-radius: 2px;
+             background: rgba(120,120,128,.2); overflow: hidden; }}
+  .covfill {{ display: block; height: 100%; background: var(--accent); border-radius: 2px; }}
   .layout {{ display: flex; touch-action: pan-y; }}
   .axis {{ width: 44px; flex: none; position: relative; height: calc({TOTAL_MIN} * var(--ppm)); }}
   .hour {{ position: absolute; right: 6px; transform: translateY(-50%); font-size: 11px;
@@ -1610,7 +1639,7 @@ def render_timeline(start_date: str, days: int, show_hidden: bool) -> str:
   // 실시간 빈 시간 칩: 진행 중 활동이 있으면 빈 시간 고정, 없으면 1분씩 증가
   (function liveEmpty() {{
     var ec = document.getElementById('emptychip');
-    if (!ec) return;
+    if (!ec || ec.dataset.live !== '1') return;  // 과거 날짜의 확정 캡슐은 갱신하지 않음
     var covered0 = parseInt(ec.dataset.covered, 10);
     var ongoing = ec.dataset.ongoing === '1';
     var n0 = new Date();
