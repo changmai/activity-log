@@ -463,6 +463,24 @@ def set_event_hidden(event_id: int, body: HideIn, x_requested_with: str = Header
     return {"ok": True, "hidden": body.hidden}
 
 
+@app.post("/events/{event_id}/delete")
+def delete_event(event_id: int, x_requested_with: str = Header(default="")):
+    if err := _ui_forbidden(x_requested_with):
+        return err
+    with get_db() as conn:
+        row, err = _get_event_or_404(conn, event_id)
+        if err:
+            return err
+        # 삭제 전 전체 내용을 복구용 로그에 보존
+        with (ROOT / "logs" / "deleted.jsonl").open("a", encoding="utf-8") as f:
+            f.write(json.dumps(
+                {"deleted_at": now_kst().isoformat(timespec="seconds"), **dict(row)},
+                ensure_ascii=False) + "\n")
+        conn.execute("DELETE FROM events WHERE id = ?", (event_id,))
+    logger.info("delete id=%s raw_text=%s", event_id, row["raw_text"])
+    return {"ok": True, "deleted": event_id}
+
+
 def fetch_events(date: str) -> list[sqlite3.Row]:
     # 회상 입력은 effective_ts로 재배치되므로 조회/정렬 모두 COALESCE 기준.
     # hidden 이벤트도 포함한다 — 시간 경계는 유지하고 렌더/집계에서만 제외 (숨김이 이전 블록을 늘리지 않게).
@@ -1088,7 +1106,7 @@ def render_timeline(start_date: str, days: int, show_hidden: bool) -> str:
                      color: var(--accent); font-weight: 600; }}
   #editbar button:active {{ opacity: .5; }}
   #editbar #endsave {{ background: var(--accent); color: #fff; flex: 1; }}
-  #hidebtn {{ color: var(--red); background: rgba(255,59,48,.1); }}
+  #hidebtn, #delbtn {{ color: var(--red); background: rgba(255,59,48,.1); }}
 </style>
 </head>
 <body>
@@ -1148,6 +1166,7 @@ def render_timeline(start_date: str, days: int, show_hidden: bool) -> str:
   <div class="ebrow">
     <button id="endsave">저장</button>
     <button id="hidebtn">숨김</button>
+    <button id="delbtn">삭제</button>
     <button id="closebtn">✕</button>
   </div>
 </div>
@@ -1464,6 +1483,8 @@ def render_timeline(start_date: str, days: int, show_hidden: bool) -> str:
     wheelbox.hidden = true;
     document.getElementById('hidebtn').textContent = b.dataset.hidden === '1' ? '숨김 해제' : '숨김';
     hideArmedAt = 0;  // 이전 블록에서 누른 숨김 1단계가 이월되지 않게
+    delArmedAt = 0;
+    document.getElementById('delbtn').textContent = '삭제';
     editbar.hidden = false;
     document.body.style.paddingBottom = '140px';
   }}
@@ -1562,6 +1583,22 @@ def render_timeline(start_date: str, days: int, show_hidden: bool) -> str:
       .catch(function (e) {{ toast(e.message); }});
   }});
 
+  // 삭제: 두 번 탭 확인 (삭제 전 내용은 서버가 복구 로그에 보존)
+  var delArmedAt = 0;
+  var delbtnEl = document.getElementById('delbtn');
+  delbtnEl.addEventListener('click', function () {{
+    if (!selected) return;
+    if (Date.now() - delArmedAt > 3000) {{
+      delArmedAt = Date.now();
+      delbtnEl.textContent = '한 번 더 누르면 삭제';
+      toast('기록이 완전히 삭제됩니다');
+      return;
+    }}
+    api('/events/' + selected.dataset.id + '/delete', {{}})
+      .then(function () {{ location.reload(); }})
+      .catch(function (e) {{ toast(e.message); }});
+  }});
+
   document.getElementById('closebtn').addEventListener('click', closeEdit);
 
   document.getElementById('datepick').addEventListener('change', function () {{
@@ -1592,23 +1629,32 @@ def render_timeline(start_date: str, days: int, show_hidden: bool) -> str:
   }});
 
   // 빠른 입력칸: 어느 기기든 브라우저에서 바로 기록 (마커 '~끝'도 동일 동작)
+  // 좌측 상단에서 선택한 날짜 기준으로 기록 (과거 날짜 보기 중이면 그 날짜 + 현재 시각)
   (function quickLog() {{
     var qi = document.getElementById('quickin');
     var qb = document.getElementById('quickbtn');
+    function selDate() {{ return document.getElementById('datepick').value || todayStr(); }}
+    if (selDate() !== todayStr()) {{
+      qi.placeholder = selDate() + ' 날짜로 기록됩니다';
+    }}
     function send() {{
       if (qb.disabled) return;  // 이중 호출 방지
       var t = qi.value.trim();
       if (!t) return;
       qb.disabled = true;
+      var body = {{ text: t, source: 'web' }};
+      var sel = selDate();
+      if (sel !== todayStr()) {{
+        // 선택 날짜 + 현재 시각으로 기록 (시각은 편집 패널에서 조정 가능)
+        body.ts = sel + 'T' + new Date().toTimeString().slice(0, 8) + '+09:00';
+      }}
       fetch('/log', {{
         method: 'POST',
         headers: {{ 'Content-Type': 'application/json', 'X-Requested-With': 'timeline' }},
-        body: JSON.stringify({{ text: t, source: 'web' }})
+        body: JSON.stringify(body)
       }}).then(function (r) {{
         if (!r.ok) throw new Error('기록 실패 ' + r.status);
-        var ds = todayStr();
-        if (document.querySelector('.canvas[data-date="' + ds + '"]')) location.reload();
-        else location.href = '/timeline?date=' + ds + '&days=' + DAYS + HQ;
+        location.reload();  // 기록된 날짜(=보고 있는 날짜)가 그대로 갱신됨
       }}).catch(function (e) {{ toast(e.message); qb.disabled = false; }});
     }}
     qi.addEventListener('keydown', function (e) {{
