@@ -230,6 +230,60 @@ def apply_plan(items: list[dict], rows_by_id: dict, run_id: str, dry: bool
     return applied, rejected, summaries
 
 
+def apply_creates(items: list[dict], rows_by_id: dict, run_id: str, now: datetime, dry: bool
+                  ) -> tuple[int, list[str], list[str]]:
+    """구간 분할 생성: 여러 구간을 담은 회상 발화를 새 블록으로 분할.
+    생성 블록은 시작/종료 필수, note='split-from-{원본id}', 감사 로그로 롤백 가능."""
+    conn = sqlite3.connect(DB_PATH)
+    created, rejected, summaries = 0, [], []
+    with AUDIT_PATH.open("a", encoding="utf-8") as audit:
+        for item in items[:12]:  # 폭주 방지 상한
+            text = (item.get("text") or "").strip()
+            cat = item.get("category")
+            src = item.get("source_id")
+            sd, ed = parse_ts(item.get("effective_ts")), parse_ts(item.get("end_ts"))
+            if not text or len(text) > 100:
+                rejected.append(f"create: 텍스트 비정상 ({text[:30]!r})")
+                continue
+            if cat not in CATEGORIES:
+                rejected.append(f"create: 알 수 없는 카테고리 '{cat}'")
+                continue
+            if src not in rows_by_id:
+                rejected.append(f"create: source_id {src}가 대상 기록에 없음")
+                continue
+            if sd is None or ed is None or ed <= sd or ed - sd > timedelta(hours=18):
+                rejected.append(f"create: 시각 범위 오류 ({item.get('effective_ts')} ~ {item.get('end_ts')})")
+                continue
+            if not (now - timedelta(hours=72) < sd <= now):
+                rejected.append(f"create: 시작이 허용 범위(최근 72h) 밖 ({sd})")
+                continue
+            note = f"split-from-{src}"
+            s_iso, e_iso = sd.isoformat(timespec="seconds"), ed.isoformat(timespec="seconds")
+            dup = conn.execute("SELECT 1 FROM events WHERE note = ? AND effective_ts = ?",
+                               (note, s_iso)).fetchone()
+            if dup:
+                continue  # 재실행 멱등성
+            if not dry:
+                cur = conn.execute(
+                    "INSERT INTO events (ts, received_at, raw_text, source, category, "
+                    "effective_ts, end_ts, note) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                    (s_iso, now.isoformat(timespec="seconds"),
+                     f"{text} ({src} 회상 발화에서 분리)", "tidy", cat, s_iso, e_iso, note))
+                audit.write(json.dumps(
+                    {"run": run_id, "at": datetime.now(KST).isoformat(timespec="seconds"),
+                     "created": cur.lastrowid,
+                     "fields": {"text": text, "category": cat, "effective_ts": s_iso,
+                                "end_ts": e_iso, "note": note}}, ensure_ascii=False) + "\n")
+            created += 1
+            summaries.append(f"신규 {sd.strftime('%H:%M')}~{ed.strftime('%H:%M')} {cat} {text}"
+                             f" (id {src}에서 분리)")
+            logger.info("%s 생성 %s~%s %s %s (src=%s)", "(dry)" if dry else "",
+                        s_iso, e_iso, cat, text, src)
+    conn.commit()
+    conn.close()
+    return created, rejected, summaries
+
+
 def rollback(run_id: str) -> int:
     if not AUDIT_PATH.exists():
         print("감사 로그 없음")
@@ -240,8 +294,12 @@ def rollback(run_id: str) -> int:
         rec = json.loads(line)
         if rec["run"] != run_id:
             continue
-        sets = ", ".join(f"{k} = ?" for k in rec["before"])
-        conn.execute(f"UPDATE events SET {sets} WHERE id = ?", [*rec["before"].values(), rec["id"]])
+        if "created" in rec:  # 분할로 생성된 블록은 삭제로 롤백
+            conn.execute("DELETE FROM events WHERE id = ?", (rec["created"],))
+        else:
+            sets = ", ".join(f"{k} = ?" for k in rec["before"])
+            conn.execute(f"UPDATE events SET {sets} WHERE id = ?",
+                         [*rec["before"].values(), rec["id"]])
         n += 1
     conn.commit()
     conn.close()
@@ -311,6 +369,10 @@ def main() -> int:
         return 1
 
     applied, rejected, summaries = apply_plan(plan.get("apply") or [], rows_by_id, run_id, args.dry_run)
+    created, c_rejected, c_summaries = apply_creates(
+        plan.get("create") or [], rows_by_id, run_id, now, args.dry_run)
+    rejected += c_rejected
+    summaries += c_summaries
     for why in rejected:
         logger.warning("거부: %s", why)
 
@@ -345,8 +407,8 @@ def main() -> int:
              "last_applied": summaries},
             ensure_ascii=False, indent=1), encoding="utf-8")
 
-    logger.info("run=%s 적용 %d건, 거부 %d건, 질문 %d건, 새 규칙 %d개 (cost=$%.4f)%s",
-                run_id, applied, len(rejected), len(asks), len(new_rules),
+    logger.info("run=%s 적용 %d건, 생성 %d건, 거부 %d건, 질문 %d건, 새 규칙 %d개 (cost=$%.4f)%s",
+                run_id, applied, created, len(rejected), len(asks), len(new_rules),
                 wrapper.get("total_cost_usd") or 0, " [dry-run]" if args.dry_run else "")
     if args.dry_run:
         print(json.dumps(plan, ensure_ascii=False, indent=1))
