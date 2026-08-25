@@ -301,6 +301,16 @@ def _get_event_or_404(conn: sqlite3.Connection, event_id: int):
     return row, None
 
 
+def _audit_ui(event_id: int, before: dict, after: dict) -> None:
+    """UI 수동 편집 감사 로그: 변경 전/후 값을 영구 보존 (server.log는 순환 삭제됨)."""
+    if before == after:
+        return  # 실제 변경 없음
+    with (ROOT / "logs" / "edit-audit.jsonl").open("a", encoding="utf-8") as f:
+        f.write(json.dumps(
+            {"at": now_kst().isoformat(timespec="seconds"), "source": "ui",
+             "id": event_id, "before": before, "after": after}, ensure_ascii=False) + "\n")
+
+
 class EndIn(BaseModel):
     end: Optional[str] = None  # "HH:MM" 또는 ISO8601, null이면 종료 시각 해제
 
@@ -315,6 +325,7 @@ def set_event_end(event_id: int, body: EndIn, x_requested_with: str = Header(def
             return err
         if body.end is None:
             conn.execute("UPDATE events SET end_ts = NULL WHERE id = ?", (event_id,))
+            _audit_ui(event_id, {"end_ts": row["end_ts"]}, {"end_ts": None})
             logger.info("end cleared id=%s", event_id)
             return {"ok": True, "end_ts": None}
         start = parse_ts(row["effective_ts"] or row["ts"])
@@ -344,6 +355,7 @@ def set_event_end(event_id: int, body: EndIn, x_requested_with: str = Header(def
             return JSONResponse({"ok": False, "error": "18시간을 넘는 활동은 저장할 수 없어요"}, status_code=400)
         end_iso = end_dt.isoformat(timespec="seconds")
         conn.execute("UPDATE events SET end_ts = ? WHERE id = ?", (end_iso, event_id))
+        _audit_ui(event_id, {"end_ts": row["end_ts"]}, {"end_ts": end_iso})
     logger.info("end set id=%s end_ts=%s", event_id, end_iso)
     return {"ok": True, "end_ts": end_iso}
 
@@ -362,6 +374,7 @@ def set_event_start(event_id: int, body: StartIn, x_requested_with: str = Header
             return err
         if body.start is None:
             conn.execute("UPDATE events SET effective_ts = NULL WHERE id = ?", (event_id,))
+            _audit_ui(event_id, {"effective_ts": row["effective_ts"]}, {"effective_ts": None})
             logger.info("start cleared id=%s", event_id)
             return {"ok": True, "effective_ts": None}
         cur_start = parse_ts(row["effective_ts"] or row["ts"])
@@ -390,6 +403,7 @@ def set_event_start(event_id: int, body: StartIn, x_requested_with: str = Header
                     {"ok": False, "error": "18시간을 넘는 활동은 저장할 수 없어요"}, status_code=400)
         start_iso = new_start.isoformat(timespec="seconds")
         conn.execute("UPDATE events SET effective_ts = ? WHERE id = ?", (start_iso, event_id))
+        _audit_ui(event_id, {"effective_ts": row["effective_ts"]}, {"effective_ts": start_iso})
     logger.info("start set id=%s effective_ts=%s", event_id, start_iso)
     return {"ok": True, "effective_ts": start_iso}
 
@@ -405,13 +419,14 @@ def set_event_category(event_id: int, body: CategoryIn, x_requested_with: str = 
     if body.category is not None and body.category not in CATEGORIES:
         return JSONResponse({"ok": False, "error": "알 수 없는 카테고리"}, status_code=400)
     with get_db() as conn:
-        _, err = _get_event_or_404(conn, event_id)
+        row, err = _get_event_or_404(conn, event_id)
         if err:
             return err
         if body.category is None:
             conn.execute("UPDATE events SET category = NULL, tags = NULL WHERE id = ?", (event_id,))
         else:
             conn.execute("UPDATE events SET category = ? WHERE id = ?", (body.category, event_id))
+        _audit_ui(event_id, {"category": row["category"]}, {"category": body.category})
     logger.info("category id=%s -> %s", event_id, body.category)
     if body.category is None:
         schedule_classify()  # 리셋된 이벤트를 곧바로 재분류
@@ -441,6 +456,8 @@ def set_event_text(event_id: int, body: TextIn, x_requested_with: str = Header(d
             "UPDATE events SET display_text = ?, category = NULL, tags = NULL WHERE id = ?",
             (new_text, event_id),
         )
+        _audit_ui(event_id, {"display_text": row["display_text"], "category": row["category"]},
+                  {"display_text": new_text, "category": None})
     logger.info("edit id=%s display_text=%s", event_id, new_text)
     schedule_classify()  # 교정된 텍스트로 곧바로 재분류
     return {"ok": True, "display_text": new_text}
@@ -455,10 +472,11 @@ def set_event_hidden(event_id: int, body: HideIn, x_requested_with: str = Header
     if err := _ui_forbidden(x_requested_with):
         return err
     with get_db() as conn:
-        _, err = _get_event_or_404(conn, event_id)
+        row, err = _get_event_or_404(conn, event_id)
         if err:
             return err
         conn.execute("UPDATE events SET hidden = ? WHERE id = ?", (1 if body.hidden else 0, event_id))
+        _audit_ui(event_id, {"hidden": row["hidden"]}, {"hidden": 1 if body.hidden else 0})
     logger.info("hide id=%s hidden=%s", event_id, body.hidden)
     return {"ok": True, "hidden": body.hidden}
 
