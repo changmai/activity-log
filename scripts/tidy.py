@@ -117,6 +117,7 @@ def fetch_days(dates: list[str]) -> list[dict]:
         "SELECT id, ts, COALESCE(effective_ts, ts) AS start, effective_ts, end_ts, "
         "raw_text, display_text, category, source, hidden, note FROM events "
         f"WHERE substr(COALESCE(effective_ts, ts), 1, 10) IN ({marks}) "
+        "AND COALESCE(note, '') != 'habit' "  # 습관 기록은 정리 대상 아님
         "ORDER BY COALESCE(effective_ts, ts), id",
         dates,
     ).fetchall()

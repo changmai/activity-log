@@ -31,8 +31,22 @@ END_MARKERS = {"끝", "종료", "end"}
 # 타임블록 계산에서 제외되는 note 값. raw_text는 보존하되 화면·통계에서만 빠진다.
 #   consumed — 'X 끝' 마커가 활동에 매칭되어 end_ts로 반영됨
 #   merged   — 같은 활동의 중복 발화를 대표 기록 1건으로 합침
-SKIP_NOTES = ("consumed", "merged")
-SKIP_NOTES_SQL = "COALESCE(note, '') NOT IN ('consumed', 'merged')"
+#   habit    — "습관 런지 30개" 같은 습관 기록 (별도 트랙 — 시간 개념 없음)
+SKIP_NOTES = ("consumed", "merged", "habit")
+SKIP_NOTES_SQL = "COALESCE(note, '') NOT IN ('consumed', 'merged', 'habit')"
+
+# "습관 <이름> [<횟수><단위>]" — 습관 트랙 발화 (코드로 판별, LLM 불필요)
+_HABIT_RE = re.compile(r"^습관[\s,.:]*(?P<body>.+)$")
+_HABIT_COUNT_RE = re.compile(r"(\d+)\s*(개|번|회|잔|분|초|세트|km|킬로|페이지|쪽)?")
+
+
+def _parse_habit(body: str):
+    """'런지 30개' → ('런지', 30) / '영양제' → ('영양제', None). 이름 없으면 (None, None)."""
+    m = _HABIT_COUNT_RE.search(body)
+    count = int(m.group(1)) if m else None
+    name = (body[:m.start()] + body[m.end():]) if m else body
+    name = re.sub(r"\s+", " ", name).strip(" ,.")
+    return (name or None), count
 
 DAY_START_HOUR = 0
 DAY_END_HOUR = 24
@@ -308,6 +322,20 @@ def post_log(body: LogIn, x_token: str = Header(default=""),
     ts_dt = parsed or now_kst()
     ts = ts_dt.isoformat(timespec="seconds")
     received_at = now_kst().isoformat(timespec="seconds")
+    # "습관 런지 30개" — 습관 트랙에만 기록 (타임블록·통계·정리 대상 아님)
+    hm = _HABIT_RE.match(text)
+    if hm:
+        name, count = _parse_habit(hm.group("body"))
+        if name:
+            with get_db() as conn:
+                cur = conn.execute(
+                    "INSERT INTO events (ts, received_at, raw_text, source, category, tags, "
+                    "display_text, note) VALUES (?, ?, ?, ?, ?, ?, ?, 'habit')",
+                    (ts, received_at, text, body.source or "voice", "기타",
+                     json.dumps({"count": count}), name),
+                )
+            logger.info("habit id=%s name=%s count=%s", cur.lastrowid, name, count)
+            return {"ok": True, "id": cur.lastrowid, "ts": ts, "habit": name, "count": count}
     # "X 끝" 마커면 열린 활동 X의 종료 시각으로 확정 기록 시도
     matched_id = match_marker_to_activity(text, ts_dt) if is_end_marker(text) else None
     # 매칭에 성공한 마커는 note='consumed' — end_ts로 이미 반영됐으므로 타임블록
@@ -1176,6 +1204,7 @@ def render_timeline(start_date: str, days: int, show_hidden: bool) -> str:
     <a class="todaybtn" href="/timeline?date={today}&days={days}{hq}">오늘</a>
     <button class="todaybtn" id="gotonow">현재</button>
     <a class="todaybtn" href="/stats">통계</a>
+    <a class="todaybtn" href="/habits">습관</a>
     {hidden_toggle}
     <div class="zoom">
       <button id="zoomout" aria-label="축소">−</button>
@@ -2014,6 +2043,152 @@ def render_stats(end_date: str) -> str:
 </div>
 </body>
 </html>"""
+
+
+def render_habits(end_date: str) -> str:
+    """습관 트랙: 최근 7일 그리드 + 연속 일수. 타임블록과 완전 분리."""
+    end = datetime.strptime(end_date, "%Y-%m-%d")
+    dates = [(end - timedelta(days=6 - i)).strftime("%Y-%m-%d") for i in range(7)]
+    prev_end = (end - timedelta(days=7)).strftime("%Y-%m-%d")
+    next_end = (end + timedelta(days=7)).strftime("%Y-%m-%d")
+    today = now_kst().strftime("%Y-%m-%d")
+
+    # 스트릭 계산을 위해 60일치 조회
+    since = (end - timedelta(days=59)).strftime("%Y-%m-%d")
+    with get_db() as conn:
+        rows = conn.execute(
+            "SELECT substr(COALESCE(effective_ts, ts), 1, 10) AS d, display_text AS name, tags "
+            "FROM events WHERE note = 'habit' "
+            "AND substr(COALESCE(effective_ts, ts), 1, 10) BETWEEN ? AND ? "
+            "ORDER BY COALESCE(effective_ts, ts)",
+            (since, dates[-1]),
+        ).fetchall()
+
+    # (이름, 날짜) → 횟수 합계 / 기록 수
+    agg: dict[str, dict[str, dict]] = {}
+    last_seen: dict[str, str] = {}
+    for r in rows:
+        name = r["name"] or "?"
+        try:
+            count = (json.loads(r["tags"] or "{}") or {}).get("count")
+        except (ValueError, TypeError):
+            count = None
+        cell = agg.setdefault(name, {}).setdefault(r["d"], {"n": 0, "sum": 0, "has_count": False})
+        cell["n"] += 1
+        if count:
+            cell["sum"] += count
+            cell["has_count"] = True
+        last_seen[name] = max(last_seen.get(name, ""), r["d"])
+
+    def streak(name: str) -> int:
+        d = datetime.strptime(today, "%Y-%m-%d")
+        if today not in agg.get(name, {}):  # 오늘 아직 안 했으면 어제부터 계산
+            d -= timedelta(days=1)
+        s = 0
+        while d.strftime("%Y-%m-%d") in agg.get(name, {}):
+            s += 1
+            d -= timedelta(days=1)
+        return s
+
+    names = sorted(agg.keys(), key=lambda n: last_seen[n], reverse=True)
+    body_rows = []
+    for name in names:
+        cells = []
+        for d in dates:
+            c = agg[name].get(d)
+            if not c:
+                cells.append('<td class="c none">·</td>')
+            elif c["has_count"]:
+                cells.append(f'<td class="c did">{c["sum"]}</td>')
+            else:
+                cells.append('<td class="c did">✓</td>')
+        done = sum(1 for d in dates if d in agg[name])
+        s = streak(name)
+        streak_html = f'<span class="streak">🔥{s}일</span>' if s >= 2 else ""
+        body_rows.append(
+            f"<tr><td class='hname'>{html_lib.escape(name)}{streak_html}</td>"
+            f"{''.join(cells)}<td class='c week'>{done}/7</td></tr>"
+        )
+    table_body = "".join(body_rows) or (
+        '<tr><td colspan="9" class="empty">아직 습관 기록이 없어요.<br>'
+        '음성이나 입력칸에 <b>"습관 런지 30개"</b> 또는 <b>"습관 영양제"</b>처럼 말하면 기록됩니다.</td></tr>'
+    )
+    head_cells = "".join(
+        f'<th class="c{" today" if d == today else ""}">{int(d[8:10])}<br>'
+        f'<span class="wd">{WEEKDAYS[datetime.strptime(d, "%Y-%m-%d").weekday()]}</span></th>'
+        for d in dates
+    )
+
+    return f"""<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>습관 · {dates[0]} ~ {end_date}</title>
+<link rel="manifest" href="/static/manifest.webmanifest">
+<link rel="apple-touch-icon" href="/static/icon-180.png">
+<style>
+  :root {{ --accent: #007aff; --red: #ff3b30; --text: #1c1c1e; --muted: #8e8e93;
+           --line: rgba(60,60,67,.13); --fill: rgba(120,120,128,.12); }}
+  * {{ box-sizing: border-box; }}
+  body {{ font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text",
+                       "Apple SD Gothic Neo", "Pretendard", "Noto Sans KR", sans-serif;
+          margin: 0; background: #f2f2f7; color: var(--text);
+          -webkit-font-smoothing: antialiased; letter-spacing: -0.015em; padding-bottom: 28px; }}
+  .topbar {{ position: sticky; top: 0; z-index: 10; background: rgba(249,249,251,.82);
+             -webkit-backdrop-filter: blur(20px) saturate(180%);
+             backdrop-filter: blur(20px) saturate(180%);
+             border-bottom: 0.5px solid var(--line);
+             padding: 10px 14px; display: flex; align-items: center; gap: 8px; }}
+  .topbar .nav {{ text-decoration: none; color: var(--accent); font-size: 17px; padding: 4px 8px; }}
+  .topbar h1 {{ font-size: 17px; margin: 0; font-weight: 700; }}
+  .topbar .range {{ font-size: 12px; color: var(--muted); font-variant-numeric: tabular-nums; }}
+  .topbar a.tl {{ margin-left: auto; text-decoration: none; color: var(--accent);
+                  font-weight: 600; font-size: 14px; background: var(--fill);
+                  border-radius: 10px; padding: 7px 12px; }}
+  .card {{ margin: 12px 14px 0; background: #fff; border-radius: 14px;
+           box-shadow: 0 1px 3px rgba(0,0,0,.05); overflow-x: auto; }}
+  table {{ width: 100%; border-collapse: collapse; font-size: 14px; }}
+  th, td {{ padding: 10px 6px; border-bottom: 0.5px solid var(--line); text-align: center; }}
+  tr:last-child td {{ border-bottom: none; }}
+  th {{ color: var(--muted); font-size: 12px; font-weight: 600;
+        font-variant-numeric: tabular-nums; }}
+  th .wd {{ font-size: 10px; font-weight: 500; }}
+  th.today {{ color: var(--red); }}
+  .hname {{ text-align: left; padding-left: 16px; font-weight: 600; white-space: nowrap; }}
+  .streak {{ margin-left: 6px; font-size: 11px; color: var(--muted); font-weight: 500; }}
+  .c {{ font-variant-numeric: tabular-nums; min-width: 34px; }}
+  .c.did {{ color: var(--accent); font-weight: 700; }}
+  .c.none {{ color: rgba(120,120,128,.35); }}
+  .c.week {{ color: var(--muted); font-size: 12px; }}
+  .empty {{ padding: 28px 16px; color: var(--muted); text-align: center; line-height: 1.7; }}
+</style>
+</head>
+<body>
+<div class="topbar">
+  <a class="nav" href="/habits?end={prev_end}">◀</a>
+  <div><h1>습관</h1><div class="range">{dates[0]} ~ {end_date}</div></div>
+  <a class="nav" href="/habits?end={next_end}">▶</a>
+  <a class="tl" href="/timeline">타임라인</a>
+</div>
+<div class="card">
+<table>
+  <tr><th class="hname" style="text-align:left;padding-left:16px">습관</th>{head_cells}<th class="c">주</th></tr>
+  {table_body}
+</table>
+</div>
+</body>
+</html>"""
+
+
+@app.get("/habits", response_class=HTMLResponse)
+def get_habits(end: Optional[str] = Query(default=None)):
+    end = end or now_kst().strftime("%Y-%m-%d")
+    try:
+        datetime.strptime(end, "%Y-%m-%d")
+    except ValueError:
+        return HTMLResponse("<h1>잘못된 날짜 형식 (YYYY-MM-DD)</h1>", status_code=400)
+    return HTMLResponse(render_habits(end), headers={"Cache-Control": "no-store"})
 
 
 @app.get("/stats", response_class=HTMLResponse)
