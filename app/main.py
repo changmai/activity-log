@@ -139,6 +139,42 @@ def schedule_classify() -> None:
         _classify_timer.start()
 
 
+# ---- 즉시 정리: 여러 구간을 담은 회상 발화가 들어오면 디바운스 후 tidy 실행 ----
+# (모바일 음성으로 "…부터 …까지 취침, …부터 육아 …" 발화 시 바로 타임블록으로 분할)
+TIDY_DEBOUNCE_SEC = float(os.environ.get("TIDY_DEBOUNCE_SEC", "90"))
+_tidy_timer: Optional[threading.Timer] = None
+_tidy_timer_lock = threading.Lock()
+
+_TIME_RANGE_RE = re.compile(r"\d{1,2}\s*[:시][0-5]?\d?\s*분?\s*[~\-]\s*\d{1,2}\s*[:시]")
+
+
+def _looks_multiseg(text: str) -> bool:
+    """다구간 회상 발화 판정: '부터/까지'와 시간 범위 표기가 2회 이상 등장하면 정리 대상."""
+    n = text.count("부터") + text.count("까지") + len(_TIME_RANGE_RE.findall(text))
+    return n >= 2
+
+
+def _run_tidy() -> None:
+    try:
+        proc = subprocess.run(
+            [sys.executable, str(ROOT / "scripts" / "tidy.py")],
+            capture_output=True, text=True, timeout=700,
+        )
+        logger.info("instant tidy done rc=%s", proc.returncode)
+    except Exception as e:  # 실패해도 정기 실행(13:00/23:30)이 안전망
+        logger.warning("instant tidy failed: %s", e)
+
+
+def schedule_tidy() -> None:
+    global _tidy_timer
+    with _tidy_timer_lock:
+        if _tidy_timer is not None:
+            _tidy_timer.cancel()
+        _tidy_timer = threading.Timer(TIDY_DEBOUNCE_SEC, _run_tidy)
+        _tidy_timer.daemon = True
+        _tidy_timer.start()
+
+
 # 서버 시작 시 미분류가 남아 있으면 한 번 예약 (재시작으로 놓친 분류 보충)
 with get_db() as _c:
     if _c.execute("SELECT 1 FROM events WHERE category IS NULL LIMIT 1").fetchone():
@@ -284,6 +320,9 @@ def post_log(body: LogIn, x_token: str = Header(default=""),
         )
     logger.info("log id=%s source=%s text=%s", cur.lastrowid, body.source, text)
     schedule_classify()  # 디바운스 후 즉시 분류
+    if matched_id is None and _looks_multiseg(text):
+        schedule_tidy()  # 다구간 회상 발화 → 디바운스 후 즉시 타임블록 분할
+        logger.info("multiseg detected id=%s — instant tidy 예약", cur.lastrowid)
     return {"ok": True, "id": cur.lastrowid, "ts": ts, "matched_end": matched_id}
 
 

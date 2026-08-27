@@ -12,6 +12,7 @@
 """
 
 import argparse
+import fcntl
 import json
 import logging
 import os
@@ -315,6 +316,14 @@ def main() -> int:
     args = ap.parse_args()
     if args.rollback:
         return rollback(args.rollback)
+
+    # 동시 실행 방지: 정기 타이머와 즉시 실행이 겹치면 텔레그램 답장 이중 처리 위험
+    lockf = (ROOT / "data" / "tidy.lock").open("w")
+    try:
+        fcntl.flock(lockf, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        logger.info("다른 tidy 실행 중 — 건너뜀")
+        return 0
 
     now = datetime.now(KST)
     date = args.date or now.strftime("%Y-%m-%d")
